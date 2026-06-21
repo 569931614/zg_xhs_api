@@ -28,6 +28,8 @@ http://localhost:8000
 
 ## API
 
+接口只接受 `www.monumentgallery.co.uk` 和 `monumentgallery.co.uk` 两个域名的商品页链接，其他域名会返回 `400`。
+
 ```http
 POST /api/scrape
 Content-Type: application/json
@@ -40,7 +42,7 @@ Content-Type: application/json
   "url": "https://www.monumentgallery.co.uk/product/garbo-fringe-lamps-by-mariyo-yagi",
   "render": "auto",
   "max_images": 40,
-  "download_images": true
+  "download_images": false
 }
 ```
 
@@ -52,51 +54,30 @@ Content-Type: application/json
 
 响应包含：
 
+- `skipped`：尺寸缺失时为 `true`，本次结果应跳过
+- `skip_reason`
 - `product.name`
-- `product.price`
+- `product.dimensions`
 - `product.description`
 - `product.details`
 - `images[].url`
 - `images[].hosted_url`
-- `images[].storage_provider`
-- `images[].local_url`
 - `result_url`
 
-## 图片上传
+尺寸信息是必获取字段。服务会在 `render=auto` 时先静态抓取，若缺少 `product.dimensions` 会自动再用浏览器渲染抓取一次；仍缺少尺寸时返回 `skipped=true`、清空 `images`。
 
-服务会先把筛选后的产品图上传到 Super 图床；如果 Super 图床上传失败，会自动上传到阿里云 OSS。
+## 图片链接
 
-Super 图床配置：
+服务会直接返回抓取到的原图链接，`images[].hosted_url` 与 `images[].url` 一致。
 
-```bash
-SUPERBED_UPLOAD_URL=https://api.superbed.cc/upload
-SUPERBED_TOKEN=你的super图床token
-SUPERBED_CATEGORIES=product-scraper
-```
-
-阿里云 OSS 兜底配置：
-
-```bash
-ALI_OSS_ACCESS_KEY_ID=你的AccessKeyId
-ALI_OSS_ACCESS_KEY_SECRET=你的AccessKeySecret
-ALI_OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
-ALI_OSS_BUCKET=你的bucket名称
-ALI_OSS_PUBLIC_BASE_URL=https://你的访问域名
-ALI_OSS_PREFIX=product-scraper
-```
-
-如果两个上传渠道都不可用，接口仍会返回本地 `local_url`，并在对应图片里写入 `upload_error`，方便排查环境变量或权限。
-
-上传成功时，图片字段会包含：
+服务不再下载图片到本地缓存；`download_images` 参数保留用于兼容旧请求，但不会触发下载。
 
 ```json
 {
-  "hosted_url": "https://...",
-  "storage_provider": "superbed"
+  "url": "https://...",
+  "hosted_url": "https://..."
 }
 ```
-
-如果 Super 图床失败但 OSS 成功，`storage_provider` 会是 `aliyun-oss`。
 
 ## Docker 部署
 

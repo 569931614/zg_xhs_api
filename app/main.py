@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
-import mimetypes
 import os
 import socket
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.schemas import ScrapeRequest, ScrapeResponse
-from app.services.extractor import USER_AGENT, extract
-from app.services.storage import upload_image_with_fallback
+from app.services.extractor import extract
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -48,6 +44,17 @@ app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 
 
 PRIVATE_HOSTS = {"localhost", "localhost.localdomain"}
+ALLOWED_HOSTS = {"www.monumentgallery.co.uk", "monumentgallery.co.uk"}
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "gbraid",
+    "wbraid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+}
 
 
 def is_private_address(hostname: str) -> bool:
@@ -81,8 +88,33 @@ def validate_public_url(url: str) -> None:
         raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
     if not parsed.hostname:
         raise HTTPException(status_code=400, detail="URL must include a hostname.")
+    if parsed.hostname.lower() not in ALLOWED_HOSTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only www.monumentgallery.co.uk and monumentgallery.co.uk URLs are supported.",
+        )
     if is_private_address(parsed.hostname):
         raise HTTPException(status_code=400, detail="Private, localhost, and internal network URLs are blocked.")
+
+
+def strip_tracking_query(url: str) -> str:
+    parsed = urlparse(url)
+    kept_params = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_lower = key.lower()
+        if key_lower in TRACKING_QUERY_PARAMS or key_lower.startswith(TRACKING_QUERY_PREFIXES):
+            continue
+        kept_params.append((key, value))
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(kept_params),
+            parsed.fragment,
+        )
+    )
 
 
 def product_is_weak(result: dict) -> bool:
@@ -94,46 +126,22 @@ def product_is_weak(result: dict) -> bool:
     return name in weak_names or len(description) < 20 or not images
 
 
-def image_extension(content_type: str, url: str) -> str:
-    ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) if content_type else ""
-    if ext == ".jpe":
-        return ".jpg"
-    if ext:
-        return ext
-    path_ext = Path(urlparse(url).path).suffix.lower()
-    return path_ext if path_ext in {".jpg", ".jpeg", ".png", ".webp", ".avif"} else ".jpg"
+def product_has_dimensions(result: dict) -> bool:
+    product = result.get("product") or {}
+    dimensions = str(product.get("dimensions") or "").strip()
+    if dimensions:
+        return True
+    details = product.get("details") or {}
+    if isinstance(details, dict):
+        return bool(str(details.get("dimensions") or "").strip())
+    return False
 
 
-def download_selected_images(job_dir: Path, job_id: str, images: list[dict]) -> list[dict]:
-    image_dir = job_dir / "images"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+def use_original_image_urls(images: list[dict]) -> list[dict]:
     enriched = []
-
-    for index, image in enumerate(images, 1):
+    for image in images:
         item = dict(image)
-        url = item["url"]
-        try:
-            response = session.get(url, timeout=30)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            ext = image_extension(content_type, url)
-            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
-            filename = f"{index:02d}_{digest}{ext}"
-            path = image_dir / filename
-            path.write_bytes(response.content)
-            item["filename"] = filename
-            item["bytes"] = path.stat().st_size
-            item["local_url"] = f"/data/{job_id}/images/{filename}"
-            try:
-                upload = upload_image_with_fallback(path, filename, content_type)
-                item["hosted_url"] = upload.url
-                item["storage_provider"] = upload.provider
-            except Exception as exc:
-                item["upload_error"] = str(exc)
-        except Exception as exc:
-            item["download_error"] = str(exc)
+        item["hosted_url"] = item.get("hosted_url") or item.get("url")
         enriched.append(item)
     return enriched
 
@@ -150,13 +158,13 @@ def health() -> dict[str, str]:
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
-    url = str(payload.url)
+    url = strip_tracking_query(str(payload.url))
     validate_public_url(url)
 
     rendered = payload.render == "always"
     try:
         result = extract(url, rendered, payload.max_images, payload.min_score)
-        if payload.render == "auto" and product_is_weak(result):
+        if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
             rendered = True
             result = extract(url, True, payload.max_images, payload.min_score)
     except Exception as exc:
@@ -166,10 +174,12 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
     job_dir = DATA_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    images = result.get("images") or []
-    if payload.download_images:
-        images = download_selected_images(job_dir, job_id, images)
-        result["images"] = images
+    skipped = not product_has_dimensions(result)
+    skip_reason = "缺少尺寸信息，已跳过。" if skipped else None
+    images = [] if skipped else use_original_image_urls(result.get("images") or [])
+    result["images"] = images
+    result["skipped"] = skipped
+    result["skip_reason"] = skip_reason
 
     result_path = job_dir / "product_extract.json"
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -179,6 +189,8 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
         input_url=result.get("input_url", url),
         fetched_url=result.get("fetched_url", url),
         rendered=rendered,
+        skipped=skipped,
+        skip_reason=skip_reason,
         product=result.get("product") or {},
         images=images,
         rejected_preview=result.get("rejected_preview") or [],

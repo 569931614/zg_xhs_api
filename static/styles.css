@@ -104,8 +104,9 @@ button:disabled {
   font-size: 24px;
 }
 
-.price {
+.dimensions {
   font-weight: 700;
+  color: #4d473e;
 }
 
 .grid {

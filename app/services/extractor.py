@@ -249,8 +249,6 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                 "description": clean_text(item.get("description")),
                 "sku": clean_text(item.get("sku") or item.get("mpn")),
                 "brand": clean_text(brand),
-                "price": clean_text(offer0.get("price")),
-                "currency": clean_text(offer0.get("priceCurrency")),
                 "availability": clean_text(offer0.get("availability")),
                 "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
                 "rating": rating,
@@ -259,6 +257,11 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
             product_info = merge_product_info(product_info, current)
             product_images.extend(extract_image_urls(item.get("image"), base_url))
     return product_info, list(dict.fromkeys(product_images))
+
+
+def normalize_detail_label(label: str) -> str:
+    normalized = clean_text(label).strip(":").strip()
+    return "dimensions" if normalized.lower() == "dimensions" else normalized
 
 
 def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
@@ -337,12 +340,24 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     labels = ["Designer", "Manufacturer", "Material", "Period", "Dimensions", "Condition"]
     details: dict[str, str] = {}
     for label in labels:
-        pattern = re.compile(rf"^{re.escape(label)}\s*:\s*(.+)$", re.I)
-        for line in lines:
-            match = pattern.match(line)
-            if match:
-                details[label] = clean_text(match.group(1))
+        same_line_pattern = re.compile(rf"^{re.escape(label)}\s*:\s*(.+)$", re.I)
+        label_only_pattern = re.compile(rf"^{re.escape(label)}\s*:?\s*$", re.I)
+        for index, line in enumerate(lines):
+            detail_key = normalize_detail_label(label)
+            if detail_key in details:
                 break
+            match = same_line_pattern.match(line)
+            if match:
+                details[detail_key] = clean_text(match.group(1))
+                break
+            if label_only_pattern.match(line):
+                for value in lines[index + 1 : index + 4]:
+                    if value.upper() in nav_words:
+                        continue
+                    if any(re.match(rf"^{re.escape(other)}\s*:?\s*$", value, re.I) for other in labels):
+                        break
+                    details[detail_key] = value
+                    break
 
     description = ""
     if price_index is not None:
@@ -376,12 +391,12 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     info: dict[str, Any] = {"source": "dom-text", "url": base_url}
     if name and (not existing_name or existing_name.lower() in {"monument", "shop", "store"}):
         info["name"] = name
-    if price:
-        info["price"] = price
     if description:
         info["description"] = description
     if details:
         info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = details["dimensions"]
     return info
 
 
@@ -401,9 +416,6 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
 
     variants = product.get("variants") or []
     first_variant = variants[0] if variants else {}
-    price = first_variant.get("price")
-    if isinstance(price, int):
-        price = f"{price / 100:.2f}"
     images = []
     for image in product.get("images") or []:
         if isinstance(image, str):
@@ -414,11 +426,100 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
         "name": clean_text(product.get("title")),
         "description": clean_text(BeautifulSoup(product.get("description") or "", "lxml").get_text(" ")),
         "sku": clean_text(first_variant.get("sku")),
-        "price": clean_text(price),
         "url": endpoint.removesuffix(".js"),
         "source": "shopify-product-json",
     }
     return info, [u for u in images if u]
+
+
+def try_monument_airtable_api(
+    url: str,
+    session: requests.Session,
+    max_images: int,
+) -> dict[str, Any] | None:
+    parsed = urlparse(url)
+    if parsed.hostname not in {"www.monumentgallery.co.uk", "monumentgallery.co.uk"}:
+        return None
+    match = re.search(r"^/product/([^/?#]+)/?$", parsed.path)
+    if not match:
+        return None
+
+    slug = match.group(1)
+    endpoint = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            "/api/airtable-items",
+            "",
+            urlencode({"slug": slug}),
+            "",
+        )
+    )
+    try:
+        response = session.get(endpoint, timeout=12, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+
+    item = data.get("item") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        return None
+
+    details = {
+        "Designer": clean_text(item.get("designer")),
+        "Manufacturer": clean_text(item.get("manufacturer")),
+        "Material": clean_text(item.get("material")),
+        "Period": clean_text(item.get("period")),
+        "dimensions": clean_text(item.get("dimensions")),
+        "Condition": clean_text(item.get("condition")),
+    }
+    details = {key: value for key, value in details.items() if value}
+    images = []
+    for image in as_list(item.get("images")):
+        if isinstance(image, str):
+            images.append(normalize_url(image, endpoint))
+    if not images and item.get("image"):
+        images.append(normalize_url(str(item["image"]), endpoint))
+    images = list(dict.fromkeys(u for u in images if u))
+
+    product_info: dict[str, Any] = {
+        "name": clean_text(item.get("displayName")),
+        "description": clean_text(item.get("description")),
+        "availability": clean_text(item.get("availability")),
+        "source": "monument-airtable-api",
+        "url": url,
+        "page_url": url,
+    }
+    if details:
+        product_info["details"] = details
+    if details.get("dimensions"):
+        product_info["dimensions"] = details["dimensions"]
+    product_info = {
+        key: value for key, value in product_info.items() if value not in (None, "", [], {})
+    }
+
+    selected_images = [
+        {
+            "url": image,
+            "score": 100,
+            "source": "monument-airtable-api",
+            "alt": product_info.get("name", ""),
+            "width": None,
+            "height": None,
+            "reasons": ["monument airtable product image"],
+        }
+        for image in images[:max_images]
+    ]
+
+    return {
+        "input_url": url,
+        "fetched_url": url,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "product": product_info,
+        "images": selected_images,
+        "rejected_preview": [],
+    }
 
 
 def infer_context_score(element: Any) -> tuple[int, list[str]]:
@@ -594,10 +695,14 @@ def download_images(images: list[dict[str, Any]], out_dir: Path, session: reques
 
 
 def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str, Any]:
-    html, final_url = fetch_rendered(url) if render else fetch_static(url)
-    soup = BeautifulSoup(html, "lxml")
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+    fast_result = try_monument_airtable_api(url, session, max_images)
+    if fast_result and fast_result.get("product", {}).get("dimensions"):
+        return fast_result
+
+    html, final_url = fetch_rendered(url) if render else fetch_static(url)
+    soup = BeautifulSoup(html, "lxml")
 
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)

@@ -8,7 +8,7 @@ class ScrapeRequest(BaseModel):
     render: Literal["auto", "always", "never"] = "auto"
     max_images: int = Field(default=40, ge=1, le=80)
     min_score: int = Field(default=25, ge=-100, le=200)
-    download_images: bool = True
+    download_images: bool = False
 
 
 class ImageResult(BaseModel):
@@ -21,10 +21,9 @@ class ImageResult(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     local_url: str | None = None
     hosted_url: str | None = None
-    storage_provider: str | None = None
     filename: str | None = None
     bytes: int | None = None
-    upload_error: str | None = None
+    download_error: str | None = None
 
 
 class ScrapeResponse(BaseModel):
@@ -32,6 +31,8 @@ class ScrapeResponse(BaseModel):
     input_url: str
     fetched_url: str
     rendered: bool
+    skipped: bool = False
+    skip_reason: str | None = None
     product: dict[str, Any]
     images: list[ImageResult]
     rejected_preview: list[dict[str, Any]] = Field(default_factory=list)
