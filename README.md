@@ -39,7 +39,7 @@ Content-Type: application/json
 {
   "url": "https://www.monumentgallery.co.uk/product/garbo-fringe-lamps-by-mariyo-yagi",
   "render": "auto",
-  "max_images": 7,
+  "max_images": 40,
   "download_images": true
 }
 ```

@@ -111,6 +111,31 @@ def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandi
     return sorted(best_by_key.values(), key=lambda c: c.score, reverse=True)
 
 
+def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    numbered: list[tuple[int, ImageCandidate]] = []
+    for item in candidates:
+        match = re.match(r"^view\s+(\d+)$", item.alt.strip(), re.I)
+        if match:
+            numbered.append((int(match.group(1)), item))
+    if len(numbered) < 3:
+        return candidates
+    numbered.sort(key=lambda pair: pair[0])
+    expected = 1
+    gallery: list[ImageCandidate] = []
+    seen_numbers: set[int] = set()
+    for number, item in numbered:
+        if number in seen_numbers:
+            continue
+        if number == expected:
+            gallery.append(item)
+            seen_numbers.add(number)
+            expected += 1
+            continue
+        if gallery:
+            break
+    return gallery if len(gallery) >= 3 else candidates
+
+
 def normalize_url(raw: str, base_url: str) -> str:
     if not raw:
         return ""
@@ -280,18 +305,29 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     }
 
     price_index = None
-    price_re = re.compile(r"^[£$€]\s?[\d,.]+|^[A-Z]{3}\s?[\d,.]+", re.I)
+    price_re = re.compile(r"^(POA|PRICE ON APPLICATION)$|^[£$€]\s?[\d,.]+|^[A-Z]{3}\s?[\d,.]+", re.I)
     for index, line in enumerate(lines):
         if price_re.search(line):
             price_index = index
             break
 
     name = ""
+    for heading in soup.find_all(["h1", "h2", "h3"]):
+        heading_text = clean_text(heading.get_text(" "))
+        if (
+            heading_text
+            and heading_text.upper() not in nav_words
+            and heading_text.upper() not in {"RECOMMENDED PRODUCTS", "RELATED PRODUCTS"}
+            and len(heading_text) > 3
+        ):
+            name = heading_text
+            break
     if price_index is not None:
-        for candidate in reversed(lines[:price_index]):
-            if candidate.upper() not in nav_words and len(candidate) > 3:
-                name = candidate
-                break
+        if not name:
+            for candidate in reversed(lines[:price_index]):
+                if candidate.upper() not in nav_words and len(candidate) > 3:
+                    name = candidate
+                    break
     if not name:
         h1 = soup.find("h1")
         if h1:
@@ -583,6 +619,7 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
         product_info.get("name", ""),
     )
     candidates = dedupe_image_candidates(candidates)
+    candidates = prefer_numbered_gallery(candidates)
     selected = [
         {
             "url": c.url,

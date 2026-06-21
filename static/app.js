@@ -51,7 +51,7 @@ form.addEventListener("submit", async (event) => {
   const payload = {
     url: form.url.value,
     render: form.render.value,
-    max_images: Number(form.max_images.value || 7),
+    max_images: Number(form.max_images.value || 40),
     download_images: true
   };
 
