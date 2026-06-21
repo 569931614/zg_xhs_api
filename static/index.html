@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Product Scraper Service</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="heading">
+          <h1>Product Scraper</h1>
+          <p>输入商品页链接，提取商品名、价格、描述和主商品图。</p>
+        </div>
+
+        <form id="scrape-form" class="form">
+          <label>
+            商品页 URL
+            <input id="url" name="url" type="url" required placeholder="https://example.com/product/item" />
+          </label>
+
+          <div class="controls">
+            <label>
+              渲染模式
+              <select id="render" name="render">
+                <option value="auto" selected>自动</option>
+                <option value="always">总是渲染</option>
+                <option value="never">不渲染</option>
+              </select>
+            </label>
+            <label>
+              图片数量
+              <input id="max_images" name="max_images" type="number" min="1" max="40" value="7" />
+            </label>
+          </div>
+
+          <button type="submit">开始抓取</button>
+        </form>
+
+        <p id="status" class="status"></p>
+      </section>
+
+      <section id="result" class="result hidden">
+        <div class="summary">
+          <h2 id="product-name"></h2>
+          <p id="product-price" class="price"></p>
+          <p id="product-description"></p>
+          <a id="json-link" href="#" target="_blank" rel="noreferrer">查看 JSON</a>
+        </div>
+        <div id="images" class="grid"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
