@@ -28,7 +28,7 @@ http://localhost:8000
 
 ## API
 
-接口只接受 `www.monumentgallery.co.uk` 和 `monumentgallery.co.uk` 两个域名的商品页链接，其他域名会返回 `400`。
+接口接受公开可访问的 `http/https` 商品页链接。服务会阻止 localhost、内网 IP、链路本地地址等 SSRF 风险地址。
 
 ```http
 POST /api/scrape
@@ -54,9 +54,10 @@ Content-Type: application/json
 
 响应包含：
 
-- `skipped`：尺寸缺失时为 `true`，本次结果应跳过
+- `skipped`：保留兼容字段，当前默认不因尺寸缺失跳过
 - `skip_reason`
 - `product.name`
+- `product.price`
 - `product.dimensions`
 - `product.description`
 - `product.details`
@@ -64,7 +65,15 @@ Content-Type: application/json
 - `images[].hosted_url`
 - `result_url`
 
-尺寸信息是必获取字段。服务会在 `render=auto` 时先静态抓取，若缺少 `product.dimensions` 会自动再用浏览器渲染抓取一次；仍缺少尺寸时返回 `skipped=true`、清空 `images`。
+服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。尺寸缺失不会阻断返回。
+
+遇到 Cloudflare / bot verification 等服务端无法通过的反爬页面时，接口会返回 `502`，错误信息类似：
+
+```json
+{
+  "detail": "Failed to scrape page: Blocked by Cloudflare/security verification page"
+}
+```
 
 ## 图片链接
 

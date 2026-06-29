@@ -44,7 +44,6 @@ app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 
 
 PRIVATE_HOSTS = {"localhost", "localhost.localdomain"}
-ALLOWED_HOSTS = {"www.monumentgallery.co.uk", "monumentgallery.co.uk"}
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_PARAMS = {
     "fbclid",
@@ -88,11 +87,6 @@ def validate_public_url(url: str) -> None:
         raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
     if not parsed.hostname:
         raise HTTPException(status_code=400, detail="URL must include a hostname.")
-    if parsed.hostname.lower() not in ALLOWED_HOSTS:
-        raise HTTPException(
-            status_code=400,
-            detail="Only www.monumentgallery.co.uk and monumentgallery.co.uk URLs are supported.",
-        )
     if is_private_address(parsed.hostname):
         raise HTTPException(status_code=400, detail="Private, localhost, and internal network URLs are blocked.")
 
@@ -146,6 +140,11 @@ def use_original_image_urls(images: list[dict]) -> list[dict]:
     return enriched
 
 
+def should_retry_render(exc: Exception) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in ("403", "Forbidden", "401", "Unauthorized", "429"))
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -163,7 +162,14 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
 
     rendered = payload.render == "always"
     try:
-        result = extract(url, rendered, payload.max_images, payload.min_score)
+        try:
+            result = extract(url, rendered, payload.max_images, payload.min_score)
+        except Exception as exc:
+            if payload.render == "auto" and not rendered and should_retry_render(exc):
+                rendered = True
+                result = extract(url, True, payload.max_images, payload.min_score)
+            else:
+                raise
         if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
             rendered = True
             result = extract(url, True, payload.max_images, payload.min_score)
@@ -174,7 +180,7 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
     job_dir = DATA_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    skipped = not product_has_dimensions(result)
+    skipped = False
     skip_reason = "缺少尺寸信息，已跳过。" if skipped else None
     images = [] if skipped else use_original_image_urls(result.get("images") or [])
     result["images"] = images

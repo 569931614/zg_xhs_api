@@ -219,6 +219,32 @@ def merge_product_info(primary: dict[str, Any], secondary: dict[str, Any]) -> di
     return merged
 
 
+def clean_product_title(title: str) -> str:
+    title = clean_text(title)
+    if not title:
+        return ""
+    separators = [" — ", " – ", " - ", " | "]
+    suffix_noise = re.compile(r"(gallery|galerie|shop|store|collectibles|design|mobilia)", re.I)
+    for separator in separators:
+        parts = [part.strip() for part in title.split(separator) if part.strip()]
+        if len(parts) >= 2 and suffix_noise.search(parts[-1]):
+            return parts[0]
+    return title
+
+
+def is_weak_existing_name(name: str) -> bool:
+    normalized = clean_text(name).lower()
+    if normalized in {"", "shop", "store", "home", "monument"}:
+        return True
+    return bool(
+        re.search(
+            r"(tables|seating|storage|mirrors|lighting|objects|new arrivals|gallery|galerie|shop|store)\s*(—|–|-|\|)",
+            normalized,
+            re.I,
+        )
+    )
+
+
 def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
     product_info: dict[str, Any] = {}
     product_images: list[str] = []
@@ -249,6 +275,8 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                 "description": clean_text(item.get("description")),
                 "sku": clean_text(item.get("sku") or item.get("mpn")),
                 "brand": clean_text(brand),
+                "price": clean_text(offer0.get("price")),
+                "currency": clean_text(offer0.get("priceCurrency")),
                 "availability": clean_text(offer0.get("availability")),
                 "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
                 "rating": rating,
@@ -261,7 +289,14 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
 
 def normalize_detail_label(label: str) -> str:
     normalized = clean_text(label).strip(":").strip()
-    return "dimensions" if normalized.lower() == "dimensions" else normalized
+    return "dimensions" if normalized.lower() in {
+        "dimensions",
+        "dimension",
+        "measurements",
+        "measurement",
+        "size",
+        "sizes",
+    } else normalized
 
 
 def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
@@ -272,7 +307,7 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
                 return clean_text(tag["content"])
         return ""
 
-    title = meta("og:title", "twitter:title") or clean_text(soup.title.string if soup.title else "")
+    title = clean_product_title(meta("og:title", "twitter:title") or clean_text(soup.title.string if soup.title else ""))
     description = meta("og:description", "description", "twitter:description")
     canonical = soup.find("link", attrs={"rel": re.compile("canonical", re.I)})
     info = {
@@ -303,6 +338,21 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         "HIRE",
         "ABOUT",
         "CONTACT",
+        "HOME",
+        "SEATING",
+        "TABLES",
+        "STORAGE",
+        "MIRRORS",
+        "LIGHTING",
+        "OBJECTS",
+        "DINING",
+        "KIDS",
+        "ARCHIVE",
+        "LOOKBOOK",
+        "CONTACT US",
+        "SIGN UP",
+        "BACK TO TABLES",
+        "PREV / NEXT",
         "SUBSCRIBE",
         "T&CS",
     }
@@ -326,7 +376,21 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
             name = heading_text
             break
     if price_index is not None:
-        if not name:
+        line_candidates = [
+            line
+            for line in lines[:price_index]
+            if line.upper() not in nav_words
+            and len(line) > 3
+            and not re.search(r"furniture|objects from|mostly|century", line, re.I)
+        ]
+        uppercase_candidates = [
+            line
+            for line in line_candidates
+            if line.upper() == line and re.search(r"[A-Z]", line)
+        ]
+        if uppercase_candidates:
+            name = uppercase_candidates[-1]
+        elif not name:
             for candidate in reversed(lines[:price_index]):
                 if candidate.upper() not in nav_words and len(candidate) > 3:
                     name = candidate
@@ -335,9 +399,25 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         h1 = soup.find("h1")
         if h1:
             name = clean_text(h1.get_text(" "))
+    name = clean_product_title(name)
 
     price = lines[price_index] if price_index is not None else ""
-    labels = ["Designer", "Manufacturer", "Material", "Period", "Dimensions", "Condition"]
+    labels = [
+        "Designer",
+        "Manufacturer",
+        "Material",
+        "Period",
+        "Dimensions",
+        "Dimension",
+        "Measurements",
+        "Measurement",
+        "Size",
+        "Sizes",
+        "Height",
+        "Width",
+        "Depth",
+        "Condition",
+    ]
     details: dict[str, str] = {}
     for label in labels:
         same_line_pattern = re.compile(rf"^{re.escape(label)}\s*:\s*(.+)$", re.I)
@@ -389,14 +469,18 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         description = clean_text(" ".join(lines[start:stop]))
 
     info: dict[str, Any] = {"source": "dom-text", "url": base_url}
-    if name and (not existing_name or existing_name.lower() in {"monument", "shop", "store"}):
+    if name and is_weak_existing_name(existing_name):
         info["name"] = name
+    if price:
+        info["price"] = price
     if description:
         info["description"] = description
     if details:
         info["details"] = details
-    if details.get("dimensions"):
-        info["dimensions"] = details["dimensions"]
+    for key in ("dimensions", "Dimension", "Measurements", "Measurement", "Size", "Sizes"):
+        if details.get(key):
+            info["dimensions"] = details[key]
+            break
     return info
 
 
@@ -643,8 +727,30 @@ def fetch_static(url: str) -> tuple[str, str]:
         return path.read_text(encoding="utf-8"), url
 
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+        }
+    )
     response = session.get(url, timeout=30)
+    if response.status_code in {401, 403, 429}:
+        try:
+            from curl_cffi import requests as curl_requests
+
+            curl_response = curl_requests.get(
+                url,
+                headers=dict(session.headers),
+                impersonate="chrome120",
+                timeout=30,
+                allow_redirects=True,
+            )
+            if curl_response.status_code < 400:
+                return curl_response.text, curl_response.url
+        except Exception:
+            pass
     response.raise_for_status()
     return response.text, response.url
 
@@ -703,6 +809,10 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
 
     html, final_url = fetch_rendered(url) if render else fetch_static(url)
     soup = BeautifulSoup(html, "lxml")
+    page_title = clean_text(soup.title.string if soup.title else "")
+    body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
+    if page_title.lower() == "just a moment..." or "performing security verification" in body_text.lower():
+        raise RuntimeError("Blocked by Cloudflare/security verification page")
 
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)
