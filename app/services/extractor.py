@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import url2pathname
 
 import requests
@@ -59,6 +59,7 @@ class ImageCandidate:
     height: int | None = None
     alt: str = ""
     source: str = ""
+    order: int = 10_000
 
     def add(self, points: int, reason: str) -> None:
         self.score += points
@@ -76,8 +77,12 @@ def clean_text(value: Any) -> str:
 def compact_url(url: str) -> str:
     parsed = urlparse(url)
     keep_params = []
+    if parsed.path.rstrip("/").endswith("/_next/image"):
+        keep_names = {"url", "w", "q", "width", "height", "format", "quality"}
+    else:
+        keep_names = {"v", "width", "height", "format", "quality"}
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.lower() in {"v", "width", "height", "format", "quality"}:
+        if key.lower() in keep_names:
             keep_params.append((key, value))
     return urlunparse(
         (
@@ -93,12 +98,23 @@ def compact_url(url: str) -> str:
 
 def image_identity_key(url: str) -> str:
     parsed = urlparse(url)
+    if parsed.path.rstrip("/").endswith("/_next/image"):
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        nested_url = params.get("url")
+        if nested_url:
+            return image_identity_key(urljoin(url, nested_url))
     path = parsed.path
     if "static.wixstatic.com" in parsed.netloc and "/media/" in path:
         media_id = path.split("/media/", 1)[1].split("/", 1)[0]
         if media_id:
             return f"wix:{media_id}"
-    return f"{parsed.netloc}{path}".lower()
+    parts = path.rsplit("/", 1)
+    dirname = parts[0] if len(parts) == 2 else ""
+    filename = unquote(parts[-1] if parts else path).lower()
+    stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
+    stem = re.sub(r"-(?:\d{2,5}x\d{2,5}|scaled)$", "", stem, flags=re.I)
+    stem = re.sub(r"-(?:600|804|1026|1281|1536|1920)$", "", stem, flags=re.I)
+    return f"{parsed.netloc}{dirname}/{stem}".lower()
 
 
 def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
@@ -156,6 +172,166 @@ def prefer_leading_filename_series(candidates: list[ImageCandidate]) -> list[Ima
         series.append(item)
     if len(series) >= 6:
         return series
+    return candidates
+
+
+def normalize_match_text(value: str) -> str:
+    value = clean_product_title(value)
+    value = re.sub(r"\.(jpe?g|png|webp|avif)$", "", value, flags=re.I)
+    value = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return clean_text(value)
+
+
+def name_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]{4,}", normalize_match_text(value))}
+
+
+def url_for_series(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.path.rstrip("/").endswith("/_next/image"):
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        nested_url = params.get("url")
+        if nested_url:
+            return urljoin(url, nested_url)
+    return url
+
+
+def image_series_key(item: ImageCandidate) -> str:
+    parsed = urlparse(url_for_series(item.url))
+    path = parsed.path
+    filename = unquote(path.rsplit("/", 1)[-1]).lower()
+    if not re.search(r"\.(jpe?g|png|webp|avif)$", filename, re.I):
+        return ""
+    stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
+    stem = re.sub(r"-(?:\d{2,5}x\d{2,5}|scaled)$", "", stem, flags=re.I)
+    stem = re.sub(r"-(?:600|804|1026|1281|1536|1920)$", "", stem, flags=re.I)
+    if re.match(r"^(?:img|dsc|dscf|dscn|pict|photo)[_-]?\d{3,6}$", stem, re.I):
+        return f"{parsed.netloc}{path.rsplit('/', 1)[0]}/camera-sequence"
+    if re.search(r"(screenshot|skærmbillede|screen-shot|whatsapp|instagram)", stem, re.I):
+        return ""
+    compact_stem = stem.replace("_", "").replace("-", "")
+    if stem.endswith("_n") or stem.endswith("_n_master") or (
+        len(compact_stem) >= 16 and all(char in "0123456789abcdef" for char in compact_stem)
+    ):
+        return ""
+    if stem in {"image", "photo", "main", "product", "0", ""}:
+        return ""
+    stem = re.sub(r"[_\s]+", "-", stem)
+    match = re.match(r"^(.+?)-\d{1,4}$", stem)
+    if match:
+        stem = match.group(1)
+    match = re.match(r"^(.+?)[_-][a-z]$", stem)
+    if match:
+        stem = match.group(1)
+    stem = re.sub(r"[-_]+$", "", stem)
+    if len(stem) < 4:
+        return ""
+    return stem
+
+
+def alt_group_key(item: ImageCandidate, product_name: str) -> str:
+    alt = normalize_match_text(item.alt)
+    if not alt or re.search(r"^\d+$", alt):
+        return ""
+    if re.search(r"\.(jpe?g|png|webp|avif)$", item.alt, re.I):
+        return ""
+    product = normalize_match_text(product_name)
+    if product and (alt == product or alt in product or product in alt):
+        return alt
+    product_tokens = name_tokens(product_name)
+    alt_tokens = name_tokens(item.alt)
+    if len(product_tokens & alt_tokens) >= 2:
+        return alt
+    return ""
+
+
+def candidate_matches_product_name(item: ImageCandidate, product_name: str) -> bool:
+    tokens = name_tokens(product_name)
+    if not tokens:
+        return False
+    haystack = normalize_match_text(f"{item.url} {item.alt}")
+    return len(tokens & set(haystack.split())) >= min(3, len(tokens))
+
+
+def dominant_host(items: list[ImageCandidate]) -> str:
+    counts: dict[str, int] = {}
+    for item in items:
+        host = urlparse(url_for_series(item.url)).netloc.lower()
+        if host:
+            counts[host] = counts.get(host, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda pair: pair[1])[0]
+
+
+def prefer_current_product_group(
+    candidates: list[ImageCandidate],
+    product_name: str,
+) -> list[ImageCandidate]:
+    if len(candidates) < 4:
+        return candidates
+
+    useful = [
+        item
+        for item in candidates
+        if item.score >= 20 and not re.search(r"\.(svg|gif|mp4|mov|webm)(\?|$)", urlparse(item.url).path, re.I)
+    ]
+    if len(useful) < 4:
+        return candidates
+
+    alt_groups: dict[str, list[ImageCandidate]] = {}
+    for item in useful:
+        key = alt_group_key(item, product_name)
+        if key:
+            alt_groups.setdefault(key, []).append(item)
+    if alt_groups:
+        best_alt = max(alt_groups.values(), key=lambda group: (len(group), sum(i.score for i in group)))
+        if len(best_alt) >= 3:
+            host = dominant_host(best_alt)
+            keep_ids = {id(item) for item in best_alt}
+            return [
+                item
+                for item in candidates
+                if id(item) in keep_ids and (not host or urlparse(url_for_series(item.url)).netloc.lower() == host)
+            ]
+
+    series_groups: dict[str, list[ImageCandidate]] = {}
+    for item in useful:
+        key = image_series_key(item)
+        if key:
+            series_groups.setdefault(key, []).append(item)
+    if series_groups:
+        product_tokens = name_tokens(product_name)
+
+        def group_rank(group: list[ImageCandidate]) -> tuple[int, int, int, int]:
+            key = image_series_key(group[0])
+            key_tokens = set(re.findall(r"[a-z0-9]{4,}", key))
+            token_overlap = len(product_tokens & key_tokens)
+            return (
+                token_overlap,
+                len(group),
+                sum(item.score for item in group),
+                -min(item.order for item in group),
+            )
+
+        best_series = max(series_groups.values(), key=group_rank)
+        best_key = image_series_key(best_series[0])
+        if len(best_series) >= 3:
+            keep_ids = {id(item) for item in best_series}
+            for item in useful:
+                if id(item) in keep_ids:
+                    continue
+                if candidate_matches_product_name(item, product_name) and item.score >= 60 and not image_series_key(item):
+                    keep_ids.add(id(item))
+            return [item for item in candidates if id(item) in keep_ids or image_series_key(item) == best_key]
+
+    top_score = max(item.score for item in useful)
+    if top_score >= 180:
+        high_confidence = [item for item in useful if item.score >= top_score * 0.6]
+        if len(high_confidence) >= 3:
+            keep_ids = {id(item) for item in high_confidence}
+            return [item for item in candidates if id(item) in keep_ids]
+
     return candidates
 
 
@@ -664,6 +840,7 @@ def add_candidate(
     reason: str,
     source: str,
     element: Any | None = None,
+    order: int = 10_000,
 ) -> None:
     url = normalize_url(raw_url, base_url)
     if not url or url.startswith("data:"):
@@ -671,8 +848,14 @@ def add_candidate(
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return
+    path = parsed.path.lower()
+    if path.rstrip("/").endswith("/0"):
+        return
+    if re.search(r"\.(mp4|mov|webm|m4v|avi|pdf|zip)(\?|$)", path, re.I):
+        return
     item = candidates.setdefault(url, ImageCandidate(url=url, source=source))
     item.add(points, reason)
+    item.order = min(item.order, order)
     if element is not None:
         item.alt = clean_text(element.get("alt") or item.alt)
         item.width = parse_size(element.get("width")) or item.width
@@ -693,12 +876,12 @@ def gather_image_candidates(
     product_name: str,
 ) -> list[ImageCandidate]:
     candidates: dict[str, ImageCandidate] = {}
-    for url in structured_images:
-        add_candidate(candidates, url, base_url, 90, "structured product image", "structured")
-    for url in meta_images:
-        add_candidate(candidates, url, base_url, 45, "open graph image", "meta")
+    for order, url in enumerate(structured_images):
+        add_candidate(candidates, url, base_url, 90, "structured product image", "structured", order=order)
+    for order, url in enumerate(meta_images, len(structured_images)):
+        add_candidate(candidates, url, base_url, 45, "open graph image", "meta", order=order)
 
-    for img in soup.find_all(["img", "source"]):
+    for order, img in enumerate(soup.find_all(["img", "source"]), len(structured_images) + len(meta_images)):
         attrs = []
         for attr in ("src", "data-src", "data-original", "data-zoom-image", "data-large_image"):
             if img.get(attr):
@@ -707,12 +890,12 @@ def gather_image_candidates(
             if img.get(attr):
                 attrs.append(pick_srcset_best(str(img[attr])))
         for raw in attrs:
-            add_candidate(candidates, raw, base_url, 12, "page image candidate", "dom", img)
+            add_candidate(candidates, raw, base_url, 12, "page image candidate", "dom", img, order=order)
 
-    for link in soup.find_all("a"):
+    for order, link in enumerate(soup.find_all("a"), 100_000):
         href = link.get("href", "")
         if re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", href, re.I):
-            add_candidate(candidates, href, base_url, 8, "linked image file", "link", link)
+            add_candidate(candidates, href, base_url, 8, "linked image file", "link", link, order=order)
 
     name_tokens = [t.lower() for t in re.findall(r"[a-zA-Z0-9]{4,}", product_name or "")][:8]
     for item in candidates.values():
@@ -736,7 +919,7 @@ def gather_image_candidates(
             elif item.width >= 500 and item.height >= 500:
                 item.add(20, "large declared dimensions")
         if re.search(r"\.(svg|gif)(\?|$)", path, re.I):
-            item.add(-25, "low-value image format")
+            item.add(-80, "low-value image format")
     ranked = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
     return ranked
 
@@ -859,6 +1042,7 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     candidates = dedupe_image_candidates(candidates)
     candidates = prefer_numbered_gallery(candidates)
     candidates = prefer_leading_filename_series(candidates)
+    candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
     selected = [
         {
             "url": c.url,
