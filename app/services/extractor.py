@@ -136,6 +136,29 @@ def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandi
     return gallery if len(gallery) >= 3 else candidates
 
 
+def prefer_leading_filename_series(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    if len(candidates) < 8:
+        return candidates
+    series: list[ImageCandidate] = []
+    first_prefix = ""
+    for item in candidates:
+        alt = item.alt.strip()
+        match = re.match(r"^(.+?)(\d{3,5})\.(jpe?g|png|webp)$", alt, re.I)
+        if not match:
+            break
+        prefix = re.sub(r"[-_\s]+$", "", match.group(1).lower())
+        if not re.search(r"[a-z]", prefix):
+            break
+        if not first_prefix:
+            first_prefix = prefix
+        if prefix != first_prefix:
+            break
+        series.append(item)
+    if len(series) >= 6:
+        return series
+    return candidates
+
+
 def normalize_url(raw: str, base_url: str) -> str:
     if not raw:
         return ""
@@ -835,6 +858,7 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     )
     candidates = dedupe_image_candidates(candidates)
     candidates = prefer_numbered_gallery(candidates)
+    candidates = prefer_leading_filename_series(candidates)
     selected = [
         {
             "url": c.url,
