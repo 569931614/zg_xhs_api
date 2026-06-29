@@ -41,7 +41,7 @@ Content-Type: application/json
 {
   "url": "https://www.monumentgallery.co.uk/product/garbo-fringe-lamps-by-mariyo-yagi",
   "render": "auto",
-  "max_images": 40,
+  "max_images": 12,
   "download_images": false
 }
 ```
@@ -51,6 +51,8 @@ Content-Type: application/json
 - `auto`：先静态抓取，不够好再浏览器渲染。
 - `always`：总是浏览器渲染。
 - `never`：只静态抓取。
+
+`max_images` 可选，范围 `1-12`，服务最多返回 12 张主商品图。
 
 响应包含：
 

@@ -33,6 +33,8 @@ USER_AGENT = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
+MAX_PRODUCT_IMAGES = 12
+
 NOISE_RE = re.compile(
     r"(logo|icon|sprite|avatar|payment|paypal|visa|mastercard|amex|klarna|"
     r"afterpay|trust|badge|seal|banner|hero|background|bg-|newsletter|"
@@ -1007,6 +1009,7 @@ def download_images(images: list[dict[str, Any]], out_dir: Path, session: reques
 
 
 def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str, Any]:
+    max_images = max(1, min(max_images, MAX_PRODUCT_IMAGES))
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
     fast_result = try_monument_airtable_api(url, session, max_images)

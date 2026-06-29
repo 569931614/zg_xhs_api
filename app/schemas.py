@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, HttpUrl
 class ScrapeRequest(BaseModel):
     url: HttpUrl
     render: Literal["auto", "always", "never"] = "auto"
-    max_images: int = Field(default=40, ge=1, le=80)
+    max_images: int = Field(default=12, ge=1, le=12)
     min_score: int = Field(default=25, ge=-100, le=200)
     download_images: bool = False
 
