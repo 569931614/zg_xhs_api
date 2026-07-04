@@ -219,6 +219,9 @@ def image_series_key(item: ImageCandidate) -> str:
     if stem in {"image", "photo", "main", "product", "0", ""}:
         return ""
     stem = re.sub(r"[_\s]+", "-", stem)
+    match = re.match(r"^(.+?)-\d{1,4}-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$", stem, re.I)
+    if match:
+        stem = match.group(1)
     match = re.match(r"^(.+?)-(\d{1,4})$", stem)
     if match:
         suffix = int(match.group(2))
