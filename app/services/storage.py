@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -19,6 +20,7 @@ USER_AGENT = (
 
 DEFAULT_SUPERBED_UPLOAD_URL = "https://api.superbed.cc/upload"
 DEFAULT_MAX_IMAGE_BYTES = 30 * 1024 * 1024
+DEFAULT_IMAGE_UPLOAD_CONCURRENCY = 20
 
 
 class ImageHostingError(RuntimeError):
@@ -140,29 +142,52 @@ def upload_to_superbed(path: Path, session: requests.Session) -> str:
     return hosted_url
 
 
-def upload_images_to_superbed(images: list[dict[str, Any]], temp_dir: Path) -> list[dict[str, Any]]:
+def image_upload_concurrency() -> int:
+    raw_value = os.getenv("IMAGE_UPLOAD_CONCURRENCY", str(DEFAULT_IMAGE_UPLOAD_CONCURRENCY)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_IMAGE_UPLOAD_CONCURRENCY
+    return max(1, value)
+
+
+def upload_one_image(index: int, image: dict[str, Any], temp_dir: Path) -> tuple[int, dict[str, Any]]:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
-    enriched: list[dict[str, Any]] = []
+    item = dict(image)
+    source_url = str(item.get("url") or "")
+    if not source_url:
+        item["upload_error"] = "Missing image URL"
+        return index, item
 
     try:
-        for image in images:
-            item = dict(image)
-            source_url = str(item.get("url") or "")
-            if not source_url:
-                item["upload_error"] = "Missing image URL"
-                enriched.append(item)
-                continue
-            try:
-                local_path, byte_count = download_image(source_url, temp_dir, session)
-                hosted_url = upload_to_superbed(local_path, session)
-                item["hosted_url"] = hosted_url
-                item["filename"] = local_path.name
-                item["bytes"] = byte_count
-            except Exception as exc:
-                item["hosted_url"] = item.get("hosted_url") or source_url
-                item["upload_error"] = str(exc)
-            enriched.append(item)
-        return enriched
+        local_path, byte_count = download_image(source_url, temp_dir, session)
+        hosted_url = upload_to_superbed(local_path, session)
+        item["hosted_url"] = hosted_url
+        item["filename"] = local_path.name
+        item["bytes"] = byte_count
+    except Exception as exc:
+        item["hosted_url"] = item.get("hosted_url") or source_url
+        item["upload_error"] = str(exc)
+    return index, item
+
+
+def upload_images_to_superbed(images: list[dict[str, Any]], temp_dir: Path) -> list[dict[str, Any]]:
+    if not images:
+        return []
+
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        results: list[dict[str, Any] | None] = [None] * len(images)
+        max_workers = min(image_upload_concurrency(), len(images))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(upload_one_image, index, image, temp_dir)
+                for index, image in enumerate(images)
+            ]
+            for future in as_completed(futures):
+                index, item = future.result()
+                results[index] = item
+        return [item for item in results if item is not None]
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

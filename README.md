@@ -90,6 +90,7 @@ SUPERBED_UPLOAD_URL=https://api.superbed.cc/upload
 SUPERBED_TOKEN=你的SuperBed token
 SUPERBED_CATEGORIES=product-scraper
 IMAGE_DOWNLOAD_MAX_BYTES=31457280
+IMAGE_UPLOAD_CONCURRENCY=20
 ```
 
 ```json
