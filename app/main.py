@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.schemas import ScrapeRequest, ScrapeResponse
 from app.services.extractor import extract
+from app.services.storage import upload_images_to_superbed
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -131,15 +132,6 @@ def product_has_dimensions(result: dict) -> bool:
     return False
 
 
-def use_original_image_urls(images: list[dict]) -> list[dict]:
-    enriched = []
-    for image in images:
-        item = dict(image)
-        item["hosted_url"] = item.get("hosted_url") or item.get("url")
-        enriched.append(item)
-    return enriched
-
-
 def should_retry_render(exc: Exception) -> bool:
     text = str(exc)
     return any(marker in text for marker in ("403", "Forbidden", "401", "Unauthorized", "429"))
@@ -182,7 +174,10 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
 
     skipped = False
     skip_reason = "缺少尺寸信息，已跳过。" if skipped else None
-    images = [] if skipped else use_original_image_urls(result.get("images") or [])
+    images = [] if skipped else upload_images_to_superbed(
+        result.get("images") or [],
+        job_dir / "_image_upload_tmp",
+    )
     result["images"] = images
     result["skipped"] = skipped
     result["skip_reason"] = skip_reason

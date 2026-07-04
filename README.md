@@ -79,9 +79,18 @@ Content-Type: application/json
 
 ## 图片链接
 
-服务会直接返回抓取到的原图链接，`images[].hosted_url` 与 `images[].url` 一致。
+服务会先下载抓取到的主商品图到 job 临时目录，再上传到 SuperBed 图床。上传完成后会删除本地临时图片，并在 `images[].hosted_url` 返回 SuperBed 图片链接。
 
-服务不再下载图片到本地缓存；`download_images` 参数保留用于兼容旧请求，但不会触发下载。
+`images[].url` 保留原始图片链接。单张图片下载或上传失败时，接口不会中断整条商品结果，会在对应图片写入 `upload_error`，并回退使用原始图片链接作为 `hosted_url`。
+
+需要配置：
+
+```env
+SUPERBED_UPLOAD_URL=https://api.superbed.cc/upload
+SUPERBED_TOKEN=你的SuperBed token
+SUPERBED_CATEGORIES=product-scraper
+IMAGE_DOWNLOAD_MAX_BYTES=31457280
+```
 
 ```json
 {

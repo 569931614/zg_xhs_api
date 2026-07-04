@@ -24,6 +24,7 @@ class ImageResult(BaseModel):
     filename: str | None = None
     bytes: int | None = None
     download_error: str | None = None
+    upload_error: str | None = None
 
 
 class ScrapeResponse(BaseModel):
