@@ -46,6 +46,39 @@ Content-Type: application/json
 }
 ```
 
+也可以一次提交多条商品链接，`urls` 最多 10 条：
+
+```json
+{
+  "urls": [
+    "https://www.monumentgallery.co.uk/product/garbo-fringe-lamps-by-mariyo-yagi",
+    "https://www.sauceldn.com/seating#/early-20th-century-antler-chairs/"
+  ],
+  "render": "auto",
+  "max_images": 12
+}
+```
+
+传 `url` 时保持原来的单条响应；传 `urls` 时返回：
+
+```json
+{
+  "results": [
+    {
+      "url": "https://...",
+      "success": true,
+      "result": {
+        "name": "...",
+        "image_links": [],
+        "dimensions": "",
+        "product_details": {}
+      },
+      "error": null
+    }
+  ]
+}
+```
+
 `render` 可选：
 
 - `auto`：先静态抓取，不够好再浏览器渲染。
@@ -80,6 +113,8 @@ Content-Type: application/json
   "min_score": 25
 }
 ```
+
+`/api/xhs/create` 同样支持 `urls` 数组。批量模式会逐条创建小红书笔记，单条失败不会中断其他链接。
 
 流程：
 
@@ -126,6 +161,7 @@ IMAGE_DOWNLOAD_MAX_BYTES=31457280
 IMAGE_UPLOAD_CONCURRENCY=6
 IMAGE_UPLOAD_TOTAL_CONCURRENCY=12
 SCRAPE_CONCURRENCY=3
+BATCH_CONCURRENCY=2
 RENDER_CONCURRENCY=2
 XHS_IMAGE_PROCESS_CONCURRENCY=20
 DUOMI_API_KEY=你的多米API key
@@ -148,12 +184,13 @@ XHS_POST_API_KEY=xhs_post
 接口仍是同步请求-响应模式，没有引入异步队列。服务通过全局并发阀门控制资源使用：
 
 - `SCRAPE_CONCURRENCY`：同时执行完整抓取流程的请求数，默认 `3`
+- `BATCH_CONCURRENCY`：单个批量请求内同时处理的商品链接数，默认 `2`
 - `RENDER_CONCURRENCY`：同时启动 Playwright 浏览器渲染的请求数，默认 `2`
 - `IMAGE_UPLOAD_CONCURRENCY`：单个请求内并发上传图片数，默认 `6`
 - `IMAGE_UPLOAD_TOTAL_CONCURRENCY`：全服务同时上传图片数，默认 `12`
 - `XHS_IMAGE_PROCESS_CONCURRENCY`：小红书图片下载/裁剪/加 logo 的并发数，默认 `20`
 
-超过并发上限的请求会同步等待空位。
+批量 `urls` 会并行处理，并保持响应结果顺序与输入链接顺序一致。超过并发上限的请求会同步等待空位。
 
 ## Docker 部署
 

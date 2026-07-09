@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import socket
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
@@ -16,7 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.schemas import ScrapeRequest, ScrapeResponse, XHSCreateRequest, XHSCreateResponse
+from app.schemas import (
+    ScrapeBatchItem,
+    ScrapeBatchResponse,
+    ScrapeRequest,
+    ScrapeResponse,
+    XHSCreateBatchItem,
+    XHSCreateBatchResponse,
+    XHSCreateRequest,
+    XHSCreateResponse,
+)
 from app.services.extractor import extract
 from app.services.storage import upload_images_to_superbed
 from app.services.xhs_pipeline import XHSPipelineError, create_xhs_note
@@ -28,9 +40,11 @@ DATA_DIR = Path(os.getenv("SCRAPER_DATA_DIR", BASE_DIR / "data")).resolve()
 STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_SCRAPE_CONCURRENCY = 3
+DEFAULT_BATCH_CONCURRENCY = 2
 _scrape_semaphore: threading.BoundedSemaphore | None = None
 _scrape_semaphore_limit = 0
 _scrape_semaphore_lock = threading.Lock()
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(
     title="Independent Product Scraper",
@@ -184,13 +198,27 @@ def compact_scrape_result(result: dict, images: list[dict]) -> dict:
     }
 
 
-def run_scrape(payload: ScrapeRequest) -> tuple[dict, str, Path]:
+def extracted_image_links(result: dict) -> list[str]:
+    return [
+        link
+        for link in (
+            str(image.get("url") or "").strip()
+            for image in result.get("images") or []
+            if isinstance(image, dict)
+        )
+        if link
+    ]
+
+
+def run_scrape_url(url_value: str, payload: ScrapeRequest, upload_images: bool = True) -> tuple[dict, str, Path]:
+    total_started = time.monotonic()
     with scrape_semaphore():
-        url = strip_tracking_query(str(payload.url))
+        url = strip_tracking_query(url_value)
         validate_public_url(url)
 
         rendered = payload.render == "always"
         try:
+            extract_started = time.monotonic()
             try:
                 result = extract(url, rendered, payload.max_images, payload.min_score)
             except Exception as exc:
@@ -202,6 +230,13 @@ def run_scrape(payload: ScrapeRequest) -> tuple[dict, str, Path]:
             if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
                 rendered = True
                 result = extract(url, True, payload.max_images, payload.min_score)
+            logger.info(
+                "scrape stage=extract url_host=%s rendered=%s images=%d elapsed=%.2fs",
+                urlparse(url).netloc,
+                rendered,
+                len(result.get("images") or []),
+                time.monotonic() - extract_started,
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Failed to scrape page: {exc}") from exc
 
@@ -209,16 +244,62 @@ def run_scrape(payload: ScrapeRequest) -> tuple[dict, str, Path]:
         job_dir = DATA_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        images = upload_images_to_superbed(
-            result.get("images") or [],
-            job_dir / "_image_upload_tmp",
-        )
-        public_result = compact_scrape_result(result, images)
+        if upload_images:
+            upload_started = time.monotonic()
+            images = upload_images_to_superbed(
+                result.get("images") or [],
+                job_dir / "_image_upload_tmp",
+            )
+            logger.info(
+                "scrape stage=upload_images job_id=%s images=%d elapsed=%.2fs",
+                job_id,
+                len(images),
+                time.monotonic() - upload_started,
+            )
+            public_result = compact_scrape_result(result, images)
+        else:
+            public_result = compact_scrape_result(result, [])
+            public_result["image_links"] = extracted_image_links(result)
 
         result_path = job_dir / "product_extract.json"
         result_path.write_text(json.dumps(public_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            "scrape stage=total job_id=%s upload_images=%s elapsed=%.2fs",
+            job_id,
+            upload_images,
+            time.monotonic() - total_started,
+        )
 
         return public_result, job_id, job_dir
+
+
+def run_scrape(payload: ScrapeRequest, upload_images: bool = True) -> tuple[dict, str, Path]:
+    return run_scrape_url(payload.product_urls()[0], payload, upload_images)
+
+
+def run_batch(urls: list[str], worker: Callable[[str], Any]) -> list[Any]:
+    max_workers = min(env_int("BATCH_CONCURRENCY", DEFAULT_BATCH_CONCURRENCY), len(urls))
+    results: list[Any] = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {executor.submit(worker, url): index for index, url in enumerate(urls)}
+        for future in as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return results
+
+
+def http_error_text(exc: HTTPException) -> str:
+    return str(exc.detail)
+
+
+def create_xhs_response(result: Any, job_id: str) -> XHSCreateResponse:
+    return XHSCreateResponse(
+        job_id=result.job_id,
+        qrcode_image_link=result.qrcode_link,
+        share_link=result.share_link,
+        title=result.title,
+        content=result.content,
+        result_path=f"/data/{job_id}/xhs_result.json",
+    )
 
 
 @app.get("/")
@@ -231,15 +312,55 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/scrape", response_model=ScrapeResponse)
-def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
-    public_result, _, _ = run_scrape(payload)
-    return ScrapeResponse(**public_result)
+@app.post("/api/scrape", response_model=ScrapeResponse | ScrapeBatchResponse)
+def scrape_product(payload: ScrapeRequest) -> ScrapeResponse | ScrapeBatchResponse:
+    if not payload.is_batch():
+        public_result, _, _ = run_scrape(payload)
+        return ScrapeResponse(**public_result)
+
+    def scrape_one(url: str) -> ScrapeBatchItem:
+        try:
+            public_result, _, _ = run_scrape_url(url, payload)
+            return ScrapeBatchItem(url=url, success=True, result=ScrapeResponse(**public_result))
+        except HTTPException as exc:
+            return ScrapeBatchItem(url=url, success=False, error=http_error_text(exc))
+        except Exception as exc:
+            return ScrapeBatchItem(url=url, success=False, error=str(exc))
+
+    results = run_batch(payload.product_urls(), scrape_one)
+    return ScrapeBatchResponse(results=results)
 
 
-@app.post("/api/xhs/create", response_model=XHSCreateResponse)
-def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse:
-    public_result, job_id, job_dir = run_scrape(payload)
+@app.post("/api/xhs/create", response_model=XHSCreateResponse | XHSCreateBatchResponse)
+def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse | XHSCreateBatchResponse:
+    if payload.is_batch():
+        def create_one(url: str) -> XHSCreateBatchItem:
+            started = time.monotonic()
+            try:
+                public_result, job_id, job_dir = run_scrape_url(url, payload, upload_images=False)
+                result = create_xhs_note(public_result, job_id, job_dir)
+                logger.info(
+                    "xhs endpoint=api_xhs_create job_id=%s elapsed=%.2fs",
+                    result.job_id,
+                    time.monotonic() - started,
+                )
+                return XHSCreateBatchItem(
+                    url=url,
+                    success=True,
+                    result=create_xhs_response(result, job_id),
+                )
+            except HTTPException as exc:
+                return XHSCreateBatchItem(url=url, success=False, error=http_error_text(exc))
+            except XHSPipelineError as exc:
+                return XHSCreateBatchItem(url=url, success=False, error=f"Failed to create XHS note: {exc}")
+            except Exception as exc:
+                return XHSCreateBatchItem(url=url, success=False, error=f"Failed to create XHS note: {exc}")
+
+        results = run_batch(payload.product_urls(), create_one)
+        return XHSCreateBatchResponse(results=results)
+
+    started = time.monotonic()
+    public_result, job_id, job_dir = run_scrape(payload, upload_images=False)
     try:
         result = create_xhs_note(public_result, job_id, job_dir)
     except XHSPipelineError as exc:
@@ -247,11 +368,9 @@ def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to create XHS note: {exc}") from exc
 
-    return XHSCreateResponse(
-        job_id=result.job_id,
-        qrcode_image_link=result.qrcode_link,
-        share_link=result.share_link,
-        title=result.title,
-        content=result.content,
-        result_path=f"/data/{job_id}/xhs_result.json",
+    logger.info(
+        "xhs endpoint=api_xhs_create job_id=%s elapsed=%.2fs",
+        result.job_id,
+        time.monotonic() - started,
     )
+    return create_xhs_response(result, job_id)

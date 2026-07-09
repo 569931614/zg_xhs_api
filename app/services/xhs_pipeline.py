@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import shutil
@@ -26,6 +27,7 @@ DEFAULT_XHS_POST_API_BASE = "https://xhspost.aivip1.top"
 DEFAULT_XHS_POST_API_KEY = "xhs_post"
 TERMINAL_SUCCESS = {"succeeded", "success", "completed", "complete"}
 TERMINAL_FAILURE = {"failed", "failure", "cancelled", "canceled", "error"}
+logger = logging.getLogger("uvicorn.error")
 
 
 class XHSPipelineError(RuntimeError):
@@ -49,6 +51,13 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         return default
     return max(minimum, value)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def session() -> requests.Session:
@@ -255,6 +264,7 @@ def wait_for_duomi_task(task_id: str) -> dict[str, Any]:
     interval = float(os.getenv("DUOMI_POLL_INTERVAL", "5"))
     timeout = float(os.getenv("DUOMI_TIMEOUT", "600"))
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     last_response: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         last_response = duomi_request_json(
@@ -263,6 +273,7 @@ def wait_for_duomi_task(task_id: str) -> dict[str, Any]:
         )
         state = str(last_response.get("state", "")).lower()
         if state in TERMINAL_SUCCESS:
+            logger.info("xhs stage=duomi_wait task_id=%s elapsed=%.2fs", task_id, time.monotonic() - started)
             return last_response
         if state in TERMINAL_FAILURE:
             raise XHSPipelineError(f"Duomi task failed with state={state}: {last_response}")
@@ -281,6 +292,7 @@ def extract_duomi_image_url(payload: dict[str, Any]) -> str:
 
 
 def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image:
+    started = time.monotonic()
     base_rule = (
         "Only expand the edges to make a clean 3:4 product photograph. Keep the original furniture "
         "unchanged. Extend the wall, floor, lighting, and background naturally. Do not add text, people, "
@@ -302,7 +314,9 @@ def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image
         raise XHSPipelineError(f"Duomi create response did not include task id: {submitted}")
     final = wait_for_duomi_task(str(task_id))
     generated_url = extract_duomi_image_url(final)
-    return download_image(generated_url)
+    image = download_image(generated_url)
+    logger.info("xhs stage=duomi_expand elapsed=%.2fs", time.monotonic() - started)
+    return image
 
 
 def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tuple[int, Path, dict[str, Any]]:
@@ -315,11 +329,16 @@ def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tup
 
     if abs(aspect_ratio(image) - TARGET_RATIO) > 0.01:
         try:
-            reference_session = session()
-            reference_url = upload_to_superbed(original_path, reference_session)
-            meta["duomi_reference_url"] = reference_url
-            image = expand_cover_with_duomi(reference_url, product_text(product))
-            meta["duomi_expanded"] = True
+            if env_bool("XHS_USE_DUOMI_EXPAND", True):
+                reference_session = session()
+                reference_url = upload_to_superbed(original_path, reference_session)
+                meta["duomi_reference_url"] = reference_url
+                image = expand_cover_with_duomi(reference_url, product_text(product))
+                meta["duomi_expanded"] = True
+            else:
+                meta["duomi_expanded"] = False
+                meta["duomi_skipped"] = "XHS_USE_DUOMI_EXPAND is disabled"
+                image = crop_to_3_4(image)
         except Exception as exc:
             meta["duomi_expanded"] = False
             meta["duomi_error"] = str(exc)
@@ -348,6 +367,7 @@ def process_gallery_image(index: int, image_url: str, job_dir: Path) -> tuple[in
 
 
 def process_images_for_xhs(image_urls: list[str], product: dict[str, Any], job_dir: Path) -> tuple[list[Path], list[dict[str, Any]]]:
+    started = time.monotonic()
     image_urls = [url for url in image_urls if url][:12]
     if not image_urls:
         raise XHSPipelineError("No product images were found for XHS note creation")
@@ -363,6 +383,12 @@ def process_images_for_xhs(image_urls: list[str], product: dict[str, Any], job_d
             index, path, meta = future.result()
             results[index] = path
             metadata[index] = meta
+    logger.info(
+        "xhs stage=process_images images=%d workers=%d elapsed=%.2fs",
+        len(image_urls),
+        workers,
+        time.monotonic() - started,
+    )
     return [results[index] for index in sorted(results)], [metadata[index] for index in sorted(metadata)]
 
 
@@ -374,6 +400,7 @@ def deepseek_api_key() -> str:
 
 
 def generate_xhs_copy(product: dict[str, Any]) -> tuple[str, str]:
+    started = time.monotonic()
     system_prompt = """你是旨丘画廊的CMO，请为这件作品写一段文案用于小红书（标题及内容）要求如下：
 
 输出格式要求：
@@ -428,6 +455,7 @@ def generate_xhs_copy(product: dict[str, Any]) -> tuple[str, str]:
         raise XHSPipelineError("DeepSeek returned empty content")
     title = parts[0]
     body = content[len(title) :].strip()
+    logger.info("xhs stage=generate_copy elapsed=%.2fs", time.monotonic() - started)
     return title, body or content
 
 
@@ -436,6 +464,7 @@ def xhs_api_base() -> str:
 
 
 def publish_xhs_note(title: str, content: str, image_paths: list[Path]) -> tuple[dict[str, Any], str]:
+    started = time.monotonic()
     api_base = xhs_api_base()
     identifier = f"product-scraper-xhs-{int(time.time())}"
     data = {
@@ -475,13 +504,20 @@ def publish_xhs_note(title: str, content: str, image_paths: list[Path]) -> tuple
         share_link = f"{api_base}/#/xhs-auto-api?id={note_data['id']}"
     if not share_link:
         raise XHSPipelineError(f"XHS publisher response did not include shareLink: {payload}")
+    logger.info("xhs stage=publish images=%d elapsed=%.2fs", len(image_paths), time.monotonic() - started)
     return payload, share_link
 
 
 def create_xhs_note(product: dict[str, Any], job_id: str, job_dir: Path) -> XHSPipelineResult:
+    started = time.monotonic()
     image_urls = list(product.get("image_links") or [])
-    processed_paths, image_metadata = process_images_for_xhs(image_urls, product, job_dir)
-    title, content = generate_xhs_copy(product)
+    parallel_started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        image_future = executor.submit(process_images_for_xhs, image_urls, product, job_dir)
+        copy_future = executor.submit(generate_xhs_copy, product)
+        processed_paths, image_metadata = image_future.result()
+        title, content = copy_future.result()
+    logger.info("xhs stage=parallel_prepare elapsed=%.2fs", time.monotonic() - parallel_started)
     publish_response, share_link = publish_xhs_note(title, content, processed_paths)
     qrcode_link = f"{xhs_api_base()}/api/html-render/qrcode?size=320&data={quote(share_link, safe='')}"
 
@@ -497,6 +533,12 @@ def create_xhs_note(product: dict[str, Any], job_id: str, job_dir: Path) -> XHSP
     }
     (job_dir / "xhs_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     shutil.rmtree(job_dir / "xhs_originals", ignore_errors=True)
+    logger.info(
+        "xhs stage=total job_id=%s images=%d elapsed=%.2fs",
+        job_id,
+        len(image_urls),
+        time.monotonic() - started,
+    )
     return XHSPipelineResult(
         job_id=job_id,
         title=title,
