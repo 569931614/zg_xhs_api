@@ -23,6 +23,9 @@ from app.services.storage import USER_AGENT, upload_to_superbed
 TARGET_RATIO = 3.0 / 4.0
 DUOMI_CREATE_URL = "https://duomiapi.com/v1/images/generations?async=true"
 DUOMI_TASK_URL_TEMPLATE = "https://duomiapi.com/v1/tasks/{task_id}"
+ARK_IMAGE_GENERATION_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+DEFAULT_ARK_IMAGE_MODEL = "doubao-seedream-5-0-260128"
+DEFAULT_ARK_IMAGE_SIZE = "1728x2304"
 DEFAULT_XHS_POST_API_BASE = "https://xhspost.aivip1.top"
 DEFAULT_XHS_POST_API_KEY = "xhs_post"
 TERMINAL_SUCCESS = {"succeeded", "success", "completed", "complete"}
@@ -243,6 +246,22 @@ def duomi_api_key() -> str:
     return value
 
 
+def ark_api_key() -> str:
+    value = os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or ""
+    if not value:
+        raise XHSPipelineError("ARK_API_KEY is not configured")
+    return value
+
+
+def expand_prompt(description: str) -> str:
+    base_rule = (
+        "Only expand the edges to make a clean 3:4 product photograph. Keep the original furniture "
+        "unchanged. Extend the wall, floor, lighting, and background naturally. Do not add text, people, "
+        "extra furniture, UI elements, logos, or unrelated objects."
+    )
+    return f"{description}\n\n{base_rule}" if description else base_rule
+
+
 def duomi_request_json(method: str, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     headers = {"Authorization": duomi_api_key()}
     kwargs: dict[str, Any] = {"timeout": 60, "headers": headers}
@@ -293,18 +312,12 @@ def extract_duomi_image_url(payload: dict[str, Any]) -> str:
 
 def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image:
     started = time.monotonic()
-    base_rule = (
-        "Only expand the edges to make a clean 3:4 product photograph. Keep the original furniture "
-        "unchanged. Extend the wall, floor, lighting, and background naturally. Do not add text, people, "
-        "extra furniture, UI elements, logos, or unrelated objects."
-    )
-    prompt = f"{description}\n\n{base_rule}" if description else base_rule
     submitted = duomi_request_json(
         "POST",
         DUOMI_CREATE_URL,
         {
             "model": "gpt-image-2",
-            "prompt": prompt,
+            "prompt": expand_prompt(description),
             "size": "3:4",
             "image": [reference_url],
         },
@@ -319,6 +332,75 @@ def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image
     return image
 
 
+def extract_ark_image_url(payload: dict[str, Any]) -> str:
+    data = payload.get("data")
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and item.get("url"):
+                return str(item["url"])
+    if isinstance(data, dict):
+        images = data.get("images")
+        if isinstance(images, list):
+            for item in images:
+                if isinstance(item, dict) and item.get("url"):
+                    return str(item["url"])
+        if data.get("url"):
+            return str(data["url"])
+    raise XHSPipelineError(f"Ark response did not include an image URL: {payload}")
+
+
+def expand_cover_with_ark(reference_url: str, description: str) -> Image.Image:
+    started = time.monotonic()
+    response = requests.post(
+        os.getenv("ARK_IMAGE_GENERATION_URL", ARK_IMAGE_GENERATION_URL),
+        headers={
+            "Authorization": f"Bearer {ark_api_key()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": os.getenv("ARK_IMAGE_MODEL", DEFAULT_ARK_IMAGE_MODEL),
+            "prompt": expand_prompt(description),
+            "image": reference_url,
+            "sequential_image_generation": "disabled",
+            "response_format": "url",
+            "size": os.getenv("ARK_IMAGE_SIZE", DEFAULT_ARK_IMAGE_SIZE),
+            "stream": False,
+            "watermark": False,
+        },
+        timeout=float(os.getenv("ARK_IMAGE_TIMEOUT", "600")),
+    )
+    if response.status_code >= 400:
+        raise XHSPipelineError(f"Ark HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise XHSPipelineError(f"Ark returned non-JSON response: {response.text[:500]}") from exc
+    if not isinstance(payload, dict):
+        raise XHSPipelineError(f"Ark returned unexpected response: {payload!r}")
+    generated_url = extract_ark_image_url(payload)
+    image = download_image(generated_url)
+    logger.info("xhs stage=ark_expand elapsed=%.2fs", time.monotonic() - started)
+    return image
+
+
+def expand_provider() -> str:
+    provider = os.getenv("XHS_EXPAND_PROVIDER", "ark").strip().lower()
+    return provider or "ark"
+
+
+def expand_enabled() -> bool:
+    return env_bool("XHS_USE_EXPAND", env_bool("XHS_USE_DUOMI_EXPAND", True))
+
+
+def expand_cover(reference_url: str, description: str) -> tuple[str, Image.Image]:
+    provider = expand_provider()
+    if provider == "ark":
+        return provider, expand_cover_with_ark(reference_url, description)
+    if provider == "duomi":
+        return provider, expand_cover_with_duomi(reference_url, description)
+    raise XHSPipelineError(f"Unsupported XHS_EXPAND_PROVIDER: {provider}")
+
+
 def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tuple[int, Path, dict[str, Any]]:
     original_dir = job_dir / "xhs_originals"
     processed_dir = job_dir / "xhs_processed"
@@ -329,22 +411,24 @@ def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tup
 
     if abs(aspect_ratio(image) - TARGET_RATIO) > 0.01:
         try:
-            if env_bool("XHS_USE_DUOMI_EXPAND", True):
+            if expand_enabled():
                 reference_session = session()
                 reference_url = upload_to_superbed(original_path, reference_session)
-                meta["duomi_reference_url"] = reference_url
-                image = expand_cover_with_duomi(reference_url, product_text(product))
-                meta["duomi_expanded"] = True
+                provider, image = expand_cover(reference_url, product_text(product))
+                meta["expand_provider"] = provider
+                meta["expand_reference_url"] = reference_url
+                meta["expanded"] = True
             else:
-                meta["duomi_expanded"] = False
-                meta["duomi_skipped"] = "XHS_USE_DUOMI_EXPAND is disabled"
+                meta["expanded"] = False
+                meta["expand_skipped"] = "XHS_USE_EXPAND is disabled"
                 image = crop_to_3_4(image)
         except Exception as exc:
-            meta["duomi_expanded"] = False
-            meta["duomi_error"] = str(exc)
+            meta["expanded"] = False
+            meta["expand_provider"] = expand_provider()
+            meta["expand_error"] = str(exc)
             image = crop_to_3_4(image)
     else:
-        meta["duomi_expanded"] = False
+        meta["expanded"] = False
 
     image = crop_to_3_4(image)
     image = add_logo(image, choose_logo_style_by_background(image))

@@ -119,7 +119,7 @@ Content-Type: application/json
 流程：
 
 - 先抓取商品名、详情、尺寸和最多 12 张主商品图。
-- 下载商品图并处理为 3:4，小红书封面图优先使用多米 GPT Image 2 扩图，所有成图底部添加 `ZIQU` 品牌文字。
+- 下载商品图并处理为 3:4，小红书封面图默认使用火山 Ark Seedream 扩图，也可切回多米 GPT Image 2，所有成图底部添加 `ZIQU` 品牌文字。
 - 使用 DeepSeek 生成小红书标题和正文。
 - 将本地处理后的图片作为小红书图文笔记发布。
 - 接口最终返回小红书笔记二维码图片链接。
@@ -164,7 +164,14 @@ SCRAPE_CONCURRENCY=3
 BATCH_CONCURRENCY=2
 RENDER_CONCURRENCY=2
 XHS_IMAGE_PROCESS_CONCURRENCY=20
+XHS_USE_EXPAND=true
+XHS_EXPAND_PROVIDER=ark
+ARK_API_KEY=你的火山Ark API key
+ARK_IMAGE_MODEL=doubao-seedream-5-0-260128
+ARK_IMAGE_SIZE=1728x2304
+ARK_IMAGE_TIMEOUT=600
 DUOMI_API_KEY=你的多米API key
+XHS_USE_DUOMI_EXPAND=true
 DEEPSEEK_API_BASE=https://api.deepseek.com
 DEEPSEEK_API_KEY=你的DeepSeek API key
 DEEPSEEK_MODEL=deepseek-v4-pro
