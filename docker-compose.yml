@@ -1,6 +1,8 @@
 services:
   product-scraper:
     build: .
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:

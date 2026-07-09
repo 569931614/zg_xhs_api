@@ -63,6 +63,45 @@ Content-Type: application/json
 
 服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。尺寸缺失不会阻断返回。
 
+### 创建小红书笔记
+
+```http
+POST /api/xhs/create
+Content-Type: application/json
+```
+
+请求参数与 `/api/scrape` 一致：
+
+```json
+{
+  "url": "https://moltocollectibles.it/en/collectibles/credenza-in-legno-effetto-bambu-anni-80/",
+  "render": "auto",
+  "max_images": 12,
+  "min_score": 25
+}
+```
+
+流程：
+
+- 先抓取商品名、详情、尺寸和最多 12 张主商品图。
+- 下载商品图并处理为 3:4，小红书封面图优先使用多米 GPT Image 2 扩图，所有成图底部添加 `ZIQU` 品牌文字。
+- 使用 DeepSeek 生成小红书标题和正文。
+- 将本地处理后的图片作为小红书图文笔记发布。
+- 接口最终返回小红书笔记二维码图片链接。
+
+响应：
+
+```json
+{
+  "job_id": "1783607518-7b810176bd",
+  "qrcode_image_link": "https://xhspost.aivip1.top/api/html-render/qrcode?size=320&data=...",
+  "share_link": "https://note.aivip1.top/#/xhs-auto-api?id=...",
+  "title": "旨丘｜...",
+  "content": "旨丘在售的这...",
+  "result_path": "/data/1783607518-7b810176bd/xhs_result.json"
+}
+```
+
 遇到 Cloudflare / bot verification 等服务端无法通过的反爬页面时，接口会返回 `502`，错误信息类似：
 
 ```json
@@ -88,6 +127,13 @@ IMAGE_UPLOAD_CONCURRENCY=6
 IMAGE_UPLOAD_TOTAL_CONCURRENCY=12
 SCRAPE_CONCURRENCY=3
 RENDER_CONCURRENCY=2
+XHS_IMAGE_PROCESS_CONCURRENCY=20
+DUOMI_API_KEY=你的多米API key
+DEEPSEEK_API_BASE=https://api.deepseek.com
+DEEPSEEK_API_KEY=你的DeepSeek API key
+DEEPSEEK_MODEL=deepseek-v4-pro
+XHS_POST_API_BASE=https://xhspost.aivip1.top
+XHS_POST_API_KEY=xhs_post
 ```
 
 ```json
@@ -105,6 +151,7 @@ RENDER_CONCURRENCY=2
 - `RENDER_CONCURRENCY`：同时启动 Playwright 浏览器渲染的请求数，默认 `2`
 - `IMAGE_UPLOAD_CONCURRENCY`：单个请求内并发上传图片数，默认 `6`
 - `IMAGE_UPLOAD_TOTAL_CONCURRENCY`：全服务同时上传图片数，默认 `12`
+- `XHS_IMAGE_PROCESS_CONCURRENCY`：小红书图片下载/裁剪/加 logo 的并发数，默认 `20`
 
 超过并发上限的请求会同步等待空位。
 

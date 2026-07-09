@@ -16,9 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.schemas import ScrapeRequest, ScrapeResponse
+from app.schemas import ScrapeRequest, ScrapeResponse, XHSCreateRequest, XHSCreateResponse
 from app.services.extractor import extract
 from app.services.storage import upload_images_to_superbed
+from app.services.xhs_pipeline import XHSPipelineError, create_xhs_note
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -183,18 +184,7 @@ def compact_scrape_result(result: dict, images: list[dict]) -> dict:
     }
 
 
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/api/scrape", response_model=ScrapeResponse)
-def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
+def run_scrape(payload: ScrapeRequest) -> tuple[dict, str, Path]:
     with scrape_semaphore():
         url = strip_tracking_query(str(payload.url))
         validate_public_url(url)
@@ -228,4 +218,40 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
         result_path = job_dir / "product_extract.json"
         result_path.write_text(json.dumps(public_result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        return ScrapeResponse(**public_result)
+        return public_result, job_id, job_dir
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/scrape", response_model=ScrapeResponse)
+def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
+    public_result, _, _ = run_scrape(payload)
+    return ScrapeResponse(**public_result)
+
+
+@app.post("/api/xhs/create", response_model=XHSCreateResponse)
+def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse:
+    public_result, job_id, job_dir = run_scrape(payload)
+    try:
+        result = create_xhs_note(public_result, job_id, job_dir)
+    except XHSPipelineError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to create XHS note: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to create XHS note: {exc}") from exc
+
+    return XHSCreateResponse(
+        job_id=result.job_id,
+        qrcode_image_link=result.qrcode_link,
+        share_link=result.share_link,
+        title=result.title,
+        content=result.content,
+        result_path=f"/data/{job_id}/xhs_result.json",
+    )

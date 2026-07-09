@@ -16,3 +16,16 @@ class ScrapeResponse(BaseModel):
     image_links: list[str] = Field(default_factory=list)
     dimensions: str = ""
     product_details: dict[str, Any] = Field(default_factory=dict)
+
+
+class XHSCreateRequest(ScrapeRequest):
+    pass
+
+
+class XHSCreateResponse(BaseModel):
+    job_id: str
+    qrcode_image_link: str
+    share_link: str
+    title: str = ""
+    content: str = ""
+    result_path: str = ""
