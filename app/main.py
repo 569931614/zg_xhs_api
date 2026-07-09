@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +26,10 @@ load_dotenv(BASE_DIR / ".env")
 DATA_DIR = Path(os.getenv("SCRAPER_DATA_DIR", BASE_DIR / "data")).resolve()
 STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_SCRAPE_CONCURRENCY = 3
+_scrape_semaphore: threading.BoundedSemaphore | None = None
+_scrape_semaphore_limit = 0
+_scrape_semaphore_lock = threading.Lock()
 
 app = FastAPI(
     title="Independent Product Scraper",
@@ -137,6 +142,47 @@ def should_retry_render(exc: Exception) -> bool:
     return any(marker in text for marker in ("403", "Forbidden", "401", "Unauthorized", "429"))
 
 
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def scrape_semaphore() -> threading.BoundedSemaphore:
+    global _scrape_semaphore, _scrape_semaphore_limit
+    limit = env_int("SCRAPE_CONCURRENCY", DEFAULT_SCRAPE_CONCURRENCY)
+    with _scrape_semaphore_lock:
+        if _scrape_semaphore is None or _scrape_semaphore_limit != limit:
+            _scrape_semaphore = threading.BoundedSemaphore(limit)
+            _scrape_semaphore_limit = limit
+        return _scrape_semaphore
+
+
+def image_link(image: dict) -> str:
+    return str(image.get("hosted_url") or image.get("local_url") or image.get("url") or "").strip()
+
+
+def compact_scrape_result(result: dict, images: list[dict]) -> dict:
+    product = result.get("product") or {}
+    details = product.get("details") if isinstance(product.get("details"), dict) else {}
+    product_details = dict(details)
+    dimensions = str(product.get("dimensions") or product_details.pop("dimensions", "") or "").strip()
+    description = str(product.get("description") or "").strip()
+    if description:
+        product_details = {"description": description, **product_details}
+    product_details.pop("dimensions", None)
+
+    return {
+        "name": str(product.get("name") or "").strip(),
+        "image_links": [link for link in (image_link(image) for image in images) if link],
+        "dimensions": dimensions,
+        "product_details": product_details,
+    }
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -149,51 +195,37 @@ def health() -> dict[str, str]:
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 def scrape_product(payload: ScrapeRequest) -> ScrapeResponse:
-    url = strip_tracking_query(str(payload.url))
-    validate_public_url(url)
+    with scrape_semaphore():
+        url = strip_tracking_query(str(payload.url))
+        validate_public_url(url)
 
-    rendered = payload.render == "always"
-    try:
+        rendered = payload.render == "always"
         try:
-            result = extract(url, rendered, payload.max_images, payload.min_score)
-        except Exception as exc:
-            if payload.render == "auto" and not rendered and should_retry_render(exc):
+            try:
+                result = extract(url, rendered, payload.max_images, payload.min_score)
+            except Exception as exc:
+                if payload.render == "auto" and not rendered and should_retry_render(exc):
+                    rendered = True
+                    result = extract(url, True, payload.max_images, payload.min_score)
+                else:
+                    raise
+            if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
                 rendered = True
                 result = extract(url, True, payload.max_images, payload.min_score)
-            else:
-                raise
-        if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
-            rendered = True
-            result = extract(url, True, payload.max_images, payload.min_score)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to scrape page: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to scrape page: {exc}") from exc
 
-    job_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
-    job_dir = DATA_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+        job_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
+        job_dir = DATA_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
 
-    skipped = False
-    skip_reason = "缺少尺寸信息，已跳过。" if skipped else None
-    images = [] if skipped else upload_images_to_superbed(
-        result.get("images") or [],
-        job_dir / "_image_upload_tmp",
-    )
-    result["images"] = images
-    result["skipped"] = skipped
-    result["skip_reason"] = skip_reason
+        images = upload_images_to_superbed(
+            result.get("images") or [],
+            job_dir / "_image_upload_tmp",
+        )
+        public_result = compact_scrape_result(result, images)
 
-    result_path = job_dir / "product_extract.json"
-    result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        result_path = job_dir / "product_extract.json"
+        result_path.write_text(json.dumps(public_result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return ScrapeResponse(
-        job_id=job_id,
-        input_url=result.get("input_url", url),
-        fetched_url=result.get("fetched_url", url),
-        rendered=rendered,
-        skipped=skipped,
-        skip_reason=skip_reason,
-        product=result.get("product") or {},
-        images=images,
-        rejected_preview=result.get("rejected_preview") or [],
-        result_url=f"/data/{job_id}/product_extract.json",
-    )
+        return ScrapeResponse(**public_result)

@@ -109,6 +109,32 @@ button:disabled {
   color: #4d473e;
 }
 
+.details {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+  gap: 8px 16px;
+  margin: 16px 0;
+  padding-top: 16px;
+  border-top: 1px solid #e4ded2;
+  font-size: 14px;
+}
+
+.details:empty {
+  display: none;
+}
+
+.details dt {
+  margin: 0;
+  font-weight: 700;
+  color: #4d473e;
+}
+
+.details dd {
+  margin: 0;
+  min-width: 0;
+  word-break: break-word;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
@@ -140,6 +166,10 @@ button:disabled {
 
 @media (max-width: 640px) {
   .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .details {
     grid-template-columns: 1fr;
   }
 

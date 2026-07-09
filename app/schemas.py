@@ -11,30 +11,8 @@ class ScrapeRequest(BaseModel):
     download_images: bool = False
 
 
-class ImageResult(BaseModel):
-    url: str
-    score: int
-    source: str = ""
-    alt: str = ""
-    width: int | None = None
-    height: int | None = None
-    reasons: list[str] = Field(default_factory=list)
-    local_url: str | None = None
-    hosted_url: str | None = None
-    filename: str | None = None
-    bytes: int | None = None
-    download_error: str | None = None
-    upload_error: str | None = None
-
-
 class ScrapeResponse(BaseModel):
-    job_id: str
-    input_url: str
-    fetched_url: str
-    rendered: bool
-    skipped: bool = False
-    skip_reason: str | None = None
-    product: dict[str, Any]
-    images: list[ImageResult]
-    rejected_preview: list[dict[str, Any]] = Field(default_factory=list)
-    result_url: str
+    name: str = ""
+    image_links: list[str] = Field(default_factory=list)
+    dimensions: str = ""
+    product_details: dict[str, Any] = Field(default_factory=dict)

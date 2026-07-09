@@ -14,8 +14,10 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +36,11 @@ USER_AGENT = (
 )
 
 MAX_PRODUCT_IMAGES = 12
+DEFAULT_RENDER_CONCURRENCY = 2
+
+_render_semaphore: threading.BoundedSemaphore | None = None
+_render_semaphore_limit = 0
+_render_semaphore_lock = threading.Lock()
 
 NOISE_RE = re.compile(
     r"(logo|icon|sprite|avatar|payment|paypal|visa|mastercard|amex|klarna|"
@@ -50,6 +57,25 @@ PRODUCT_RE = re.compile(
 )
 
 SMALL_SIZE_RE = re.compile(r"(^|[_-])(\d{1,2})x(\d{1,2})([_\.-]|$)", re.I)
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def render_semaphore() -> threading.BoundedSemaphore:
+    global _render_semaphore, _render_semaphore_limit
+    limit = env_int("RENDER_CONCURRENCY", DEFAULT_RENDER_CONCURRENCY)
+    with _render_semaphore_lock:
+        if _render_semaphore is None or _render_semaphore_limit != limit:
+            _render_semaphore = threading.BoundedSemaphore(limit)
+            _render_semaphore_limit = limit
+        return _render_semaphore
 
 
 @dataclass
@@ -420,6 +446,11 @@ def merge_product_info(primary: dict[str, Any], secondary: dict[str, Any]) -> di
     for key, value in secondary.items():
         if value in (None, "", [], {}):
             continue
+        if key == "details" and isinstance(value, dict) and isinstance(merged.get(key), dict):
+            combined = dict(value)
+            combined.update(merged[key])
+            merged[key] = combined
+            continue
         if not merged.get(key):
             merged[key] = value
     return merged
@@ -436,6 +467,60 @@ def clean_product_title(title: str) -> str:
         if len(parts) >= 2 and suffix_noise.search(parts[-1]):
             return parts[0]
     return title
+
+
+def clean_detail_key(key: Any) -> str:
+    return clean_text(str(key)).strip(":").strip()
+
+
+def clean_detail_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, list):
+        items = [clean_detail_value(item) for item in value]
+        return [item for item in items if item not in (None, "", [], {})]
+    if isinstance(value, dict):
+        item: dict[str, Any] = {}
+        for key, nested_value in value.items():
+            detail_key = clean_detail_key(key)
+            if not detail_key:
+                continue
+            cleaned = clean_detail_value(nested_value)
+            if cleaned not in (None, "", [], {}):
+                item[detail_key] = cleaned
+        return item
+    return clean_text(value)
+
+
+def details_from_mapping(mapping: dict[str, Any], excluded_keys: set[str] | None = None) -> dict[str, Any]:
+    excluded = {key.lower() for key in (excluded_keys or set())}
+    details: dict[str, Any] = {}
+    for key, value in mapping.items():
+        detail_key = clean_detail_key(key)
+        if not detail_key or detail_key.lower() in excluded:
+            continue
+        cleaned = clean_detail_value(value)
+        if cleaned not in (None, "", [], {}):
+            details[normalize_detail_label(detail_key)] = cleaned
+    return details
+
+
+def details_from_property_values(value: Any) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    for item in as_list(value):
+        if not isinstance(item, dict):
+            continue
+        name = clean_detail_key(item.get("name") or item.get("propertyID"))
+        if not name:
+            continue
+        detail_value = clean_detail_value(item.get("value") or item.get("description"))
+        if detail_value not in (None, "", [], {}):
+            details[normalize_detail_label(name)] = detail_value
+    return details
 
 
 def is_weak_existing_name(name: str) -> bool:
@@ -488,6 +573,24 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                 "rating": rating,
                 "source": "json-ld",
             }
+            details = details_from_mapping(
+                item,
+                {
+                    "@context",
+                    "@type",
+                    "type",
+                    "name",
+                    "description",
+                    "image",
+                    "offers",
+                    "url",
+                    "aggregateRating",
+                    "additionalProperty",
+                },
+            )
+            details.update(details_from_property_values(item.get("additionalProperty")))
+            if details:
+                current["details"] = details
             product_info = merge_product_info(product_info, current)
             product_images.extend(extract_image_urls(item.get("image"), base_url))
     return product_info, list(dict.fromkeys(product_images))
@@ -495,14 +598,21 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
 
 def normalize_detail_label(label: str) -> str:
     normalized = clean_text(label).strip(":").strip()
-    return "dimensions" if normalized.lower() in {
+    lower = normalized.lower()
+    if lower in {
         "dimensions",
         "dimension",
         "measurements",
         "measurement",
         "size",
         "sizes",
-    } else normalized
+    }:
+        return "dimensions"
+    if lower in {"sku", "stock keeping unit"}:
+        return "sku"
+    if lower in {"mpn", "manufacturer part number"}:
+        return "mpn"
+    return normalized
 
 
 def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
@@ -526,6 +636,95 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
         normalize_url(meta("og:image", "twitter:image", "twitter:image:src"), base_url),
     ]
     return info, [u for u in images if u]
+
+
+def line_looks_like_dimensions(line: str) -> bool:
+    return bool(
+        re.search(r"\b(?:W|D|H|L|Dia|Diameter)\.?\s*\d", line, re.I)
+        and re.search(r"\b(?:cm|mm|in|inch|inches|m)\b", line, re.I)
+    )
+
+
+def extract_heading_text_block(
+    soup: BeautifulSoup,
+    product_name: str,
+    price_re: re.Pattern[str],
+    nav_words: set[str],
+) -> dict[str, Any]:
+    if not product_name:
+        return {}
+
+    def normalize_heading(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", clean_text(value).lower()).strip()
+
+    wanted = normalize_heading(product_name)
+    heading = None
+    for candidate in soup.find_all(["h1", "h2", "h3"]):
+        text = clean_text(candidate.get_text(" "))
+        if text and normalize_heading(text) == wanted:
+            heading = candidate
+            break
+    if heading is None:
+        return {}
+
+    container = heading.find_parent(class_=re.compile(r"(sqs-html-content|product|detail|description)", re.I))
+    if container is None:
+        container = heading.parent
+    if container is None:
+        return {}
+
+    block_lines: list[str] = []
+    found_heading = False
+    for element in container.find_all(["h1", "h2", "h3", "p", "li"], recursive=False):
+        text = clean_text(element.get_text(" "))
+        if not text:
+            continue
+        if not found_heading:
+            if element == heading or normalize_heading(text) == wanted:
+                found_heading = True
+            continue
+        if text.upper() in nav_words:
+            break
+        block_lines.append(text)
+
+    if not block_lines:
+        return {}
+
+    price = ""
+    content_lines: list[str] = []
+    for line in block_lines:
+        if price_re.search(line):
+            price = line
+            break
+        if re.search(r"^(ENQUIRE|SOLD|ADD TO CART|BUY NOW)$", line, re.I):
+            break
+        content_lines.append(line)
+
+    details: dict[str, Any] = {}
+    description_lines: list[str] = []
+    for line in content_lines:
+        if line_looks_like_dimensions(line):
+            details.setdefault("dimensions", line)
+            continue
+        seat_height = re.match(r"^(Seat\s+height)\s*:?\s*(.+)$", line, re.I)
+        if seat_height:
+            details.setdefault(clean_text(seat_height.group(1)).title(), clean_text(seat_height.group(2)))
+            continue
+        if re.search(r"\bc\.\s*\d{3,4}\b|\b\d{4}s?\b", line, re.I) and len(line) <= 140:
+            details.setdefault("Origin / period", line)
+            continue
+        description_lines.append(line)
+
+    info: dict[str, Any] = {}
+    if price:
+        info["price"] = price
+    if description_lines:
+        info["description"] = clean_text(" ".join(description_lines))
+    if details:
+        info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
+    return info
 
 
 def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: str = "") -> dict[str, Any]:
@@ -624,7 +823,45 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         "Depth",
         "Condition",
     ]
-    details: dict[str, str] = {}
+    details: dict[str, Any] = {}
+
+    def add_detail(label: Any, value: Any) -> None:
+        detail_key = normalize_detail_label(clean_detail_key(label))
+        detail_value = clean_detail_value(value)
+        if (
+            not detail_key
+            or detail_value in (None, "", [], {})
+            or detail_key.upper() in nav_words
+            or str(detail_value).upper() in nav_words
+        ):
+            return
+        if len(detail_key) > 80 or len(str(detail_value)) > 1000:
+            return
+        details.setdefault(detail_key, detail_value)
+
+    for row in soup.find_all("tr"):
+        cells = [clean_text(cell.get_text(" ")) for cell in row.find_all(["th", "td"])]
+        cells = [cell for cell in cells if cell]
+        if len(cells) >= 2:
+            add_detail(cells[0], " ".join(cells[1:]))
+
+    for definition_list in soup.find_all("dl"):
+        terms = definition_list.find_all("dt")
+        for term in terms:
+            values = []
+            sibling = term.find_next_sibling()
+            while sibling and sibling.name != "dt":
+                if sibling.name == "dd":
+                    values.append(clean_text(sibling.get_text(" ")))
+                sibling = sibling.find_next_sibling()
+            if values:
+                add_detail(term.get_text(" "), " ".join(values))
+
+    for line in lines:
+        match = re.match(r"^([^:：]{2,80})\s*[:：]\s*(.{1,1000})$", line)
+        if match:
+            add_detail(match.group(1), match.group(2))
+
     for label in labels:
         same_line_pattern = re.compile(rf"^{re.escape(label)}\s*:\s*(.+)$", re.I)
         label_only_pattern = re.compile(rf"^{re.escape(label)}\s*:?\s*$", re.I)
@@ -634,7 +871,7 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                 break
             match = same_line_pattern.match(line)
             if match:
-                details[detail_key] = clean_text(match.group(1))
+                add_detail(detail_key, match.group(1))
                 break
             if label_only_pattern.match(line):
                 for value in lines[index + 1 : index + 4]:
@@ -642,8 +879,10 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                         continue
                     if any(re.match(rf"^{re.escape(other)}\s*:?\s*$", value, re.I) for other in labels):
                         break
-                    details[detail_key] = value
+                    add_detail(detail_key, value)
                     break
+
+    heading_info = extract_heading_text_block(soup, name, price_re, nav_words)
 
     description = ""
     if price_index is not None:
@@ -677,16 +916,20 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     info: dict[str, Any] = {"source": "dom-text", "url": base_url}
     if name and is_weak_existing_name(existing_name):
         info["name"] = name
-    if price:
+    if heading_info.get("price"):
+        info["price"] = heading_info["price"]
+    elif price:
         info["price"] = price
-    if description:
+    if heading_info.get("description"):
+        info["description"] = heading_info["description"]
+    elif description:
         info["description"] = description
+    if isinstance(heading_info.get("details"), dict):
+        details.update(heading_info["details"])
     if details:
         info["details"] = details
-    for key in ("dimensions", "Dimension", "Measurements", "Measurement", "Size", "Sizes"):
-        if details.get(key):
-            info["dimensions"] = details[key]
-            break
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
     return info
 
 
@@ -719,6 +962,12 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
         "url": endpoint.removesuffix(".js"),
         "source": "shopify-product-json",
     }
+    details = details_from_mapping(
+        product,
+        {"title", "description", "body_html", "image", "images", "featured_image"},
+    )
+    if details:
+        info["details"] = details
     return info, [u for u in images if u]
 
 
@@ -756,7 +1005,7 @@ def try_monument_airtable_api(
     if not isinstance(item, dict):
         return None
 
-    details = {
+    details: dict[str, Any] = {
         "Designer": clean_text(item.get("designer")),
         "Manufacturer": clean_text(item.get("manufacturer")),
         "Material": clean_text(item.get("material")),
@@ -765,6 +1014,23 @@ def try_monument_airtable_api(
         "Condition": clean_text(item.get("condition")),
     }
     details = {key: value for key, value in details.items() if value}
+    extra_details = details_from_mapping(
+        item,
+        {
+            "images",
+            "image",
+            "displayName",
+            "description",
+            "availability",
+            "designer",
+            "manufacturer",
+            "material",
+            "period",
+            "dimensions",
+            "condition",
+        },
+    )
+    details.update(extra_details)
     images = []
     for image in as_list(item.get("images")):
         if isinstance(image, str):
@@ -974,18 +1240,21 @@ def fetch_rendered(url: str) -> tuple[str, str]:
     except ImportError as exc:
         raise RuntimeError("Playwright is not installed. Run without --render or install playwright.") from exc
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1440, "height": 1600})
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            pass
-        page.wait_for_timeout(1500)
-        html = page.content()
-        final_url = page.url
-        browser.close()
+    with render_semaphore():
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1440, "height": 1600})
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=12000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+                html = page.content()
+                final_url = page.url
+            finally:
+                browser.close()
     return html, final_url
 
 

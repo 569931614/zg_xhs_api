@@ -4,7 +4,7 @@ const resultEl = document.querySelector("#result");
 const nameEl = document.querySelector("#product-name");
 const dimensionsEl = document.querySelector("#product-dimensions");
 const descriptionEl = document.querySelector("#product-description");
-const jsonLink = document.querySelector("#json-link");
+const detailsEl = document.querySelector("#product-details");
 const imagesEl = document.querySelector("#images");
 
 function setStatus(message) {
@@ -12,33 +12,41 @@ function setStatus(message) {
 }
 
 function renderResult(data) {
-  const product = data.product || {};
-  nameEl.textContent = product.name || "未识别商品名";
-  dimensionsEl.textContent = product.dimensions ? `尺寸：${product.dimensions}` : "";
-  descriptionEl.textContent = product.description || "";
-  jsonLink.href = data.result_url;
+  const productDetails = data.product_details || {};
+  nameEl.textContent = data.name || "未识别商品名";
+  dimensionsEl.textContent = data.dimensions ? `尺寸：${data.dimensions}` : "";
+  descriptionEl.textContent = productDetails.description || "";
   imagesEl.innerHTML = "";
+  detailsEl.innerHTML = "";
 
-  if (data.skipped) {
-    descriptionEl.textContent = data.skip_reason || "缺少尺寸信息，已跳过。";
-    resultEl.classList.remove("hidden");
-    return;
+  for (const [key, value] of Object.entries(productDetails)) {
+    if (key === "description") {
+      continue;
+    }
+    const term = document.createElement("dt");
+    term.textContent = key;
+
+    const description = document.createElement("dd");
+    description.textContent = typeof value === "object" ? JSON.stringify(value) : String(value);
+
+    detailsEl.appendChild(term);
+    detailsEl.appendChild(description);
   }
 
-  for (const image of data.images || []) {
+  for (const linkUrl of data.image_links || []) {
     const tile = document.createElement("article");
     tile.className = "tile";
 
     const img = document.createElement("img");
-    img.src = image.hosted_url || image.local_url || image.url;
-    img.alt = image.alt || product.name || "Product image";
+    img.src = linkUrl;
+    img.alt = data.name || "Product image";
     tile.appendChild(img);
 
     const link = document.createElement("a");
-    link.href = image.hosted_url || image.local_url || image.url;
+    link.href = linkUrl;
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.textContent = image.hosted_url || image.url;
+    link.textContent = linkUrl;
     tile.appendChild(link);
 
     imagesEl.appendChild(tile);
@@ -72,11 +80,7 @@ form.addEventListener("submit", async (event) => {
       throw new Error(data.detail || "抓取失败");
     }
     renderResult(data);
-    if (data.skipped) {
-      setStatus(data.skip_reason || "缺少尺寸信息，已跳过。");
-    } else {
-      setStatus(`完成：${data.rendered ? "已使用浏览器渲染" : "静态抓取"}，获取 ${data.images.length} 张图片。`);
-    }
+    setStatus(`完成：获取 ${data.image_links.length} 张图片。`);
   } catch (error) {
     setStatus(error.message);
   } finally {

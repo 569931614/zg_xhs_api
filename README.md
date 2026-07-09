@@ -1,6 +1,6 @@
 # Product Scraper Service
 
-通过商品页链接提取商品名、价格、描述和主商品图，过滤推荐商品图、联系图标、logo、社媒图、支付图标等干扰资产。
+通过商品页链接提取商品名、图片链接、尺寸和产品详情，过滤推荐商品图、联系图标、logo、社媒图、支付图标等干扰资产。
 
 ## 技术选型
 
@@ -54,18 +54,12 @@ Content-Type: application/json
 
 `max_images` 可选，范围 `1-12`，服务最多返回 12 张主商品图。
 
-响应包含：
+响应只包含：
 
-- `skipped`：保留兼容字段，当前默认不因尺寸缺失跳过
-- `skip_reason`
-- `product.name`
-- `product.price`
-- `product.dimensions`
-- `product.description`
-- `product.details`
-- `images[].url`
-- `images[].hosted_url`
-- `result_url`
+- `name`：商品名
+- `image_links`：图片链接，优先返回上传后的图床链接
+- `dimensions`：尺寸
+- `product_details`：产品详情，包含描述和其他可识别详情字段
 
 服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。尺寸缺失不会阻断返回。
 
@@ -79,9 +73,9 @@ Content-Type: application/json
 
 ## 图片链接
 
-服务会先下载抓取到的主商品图到 job 临时目录，再上传到 SuperBed 图床。上传完成后会删除本地临时图片，并在 `images[].hosted_url` 返回 SuperBed 图片链接。
+服务会先下载抓取到的主商品图到 job 临时目录，再上传到 SuperBed 图床。上传完成后会删除本地临时图片，并在 `image_links` 返回 SuperBed 图片链接。
 
-`images[].url` 保留原始图片链接。单张图片下载或上传失败时，接口不会中断整条商品结果，会在对应图片写入 `upload_error`，并回退使用原始图片链接作为 `hosted_url`。
+单张图片下载或上传失败时，接口不会中断整条商品结果，会回退使用原始图片链接。
 
 需要配置：
 
@@ -90,7 +84,10 @@ SUPERBED_UPLOAD_URL=https://api.superbed.cc/upload
 SUPERBED_TOKEN=你的SuperBed token
 SUPERBED_CATEGORIES=product-scraper
 IMAGE_DOWNLOAD_MAX_BYTES=31457280
-IMAGE_UPLOAD_CONCURRENCY=20
+IMAGE_UPLOAD_CONCURRENCY=6
+IMAGE_UPLOAD_TOTAL_CONCURRENCY=12
+SCRAPE_CONCURRENCY=3
+RENDER_CONCURRENCY=2
 ```
 
 ```json
@@ -99,6 +96,17 @@ IMAGE_UPLOAD_CONCURRENCY=20
   "hosted_url": "https://..."
 }
 ```
+
+## 并发控制
+
+接口仍是同步请求-响应模式，没有引入异步队列。服务通过全局并发阀门控制资源使用：
+
+- `SCRAPE_CONCURRENCY`：同时执行完整抓取流程的请求数，默认 `3`
+- `RENDER_CONCURRENCY`：同时启动 Playwright 浏览器渲染的请求数，默认 `2`
+- `IMAGE_UPLOAD_CONCURRENCY`：单个请求内并发上传图片数，默认 `6`
+- `IMAGE_UPLOAD_TOTAL_CONCURRENCY`：全服务同时上传图片数，默认 `12`
+
+超过并发上限的请求会同步等待空位。
 
 ## Docker 部署
 

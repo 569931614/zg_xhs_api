@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,25 @@ USER_AGENT = (
 
 DEFAULT_SUPERBED_UPLOAD_URL = "https://api.superbed.cc/upload"
 DEFAULT_MAX_IMAGE_BYTES = 30 * 1024 * 1024
-DEFAULT_IMAGE_UPLOAD_CONCURRENCY = 20
+DEFAULT_IMAGE_UPLOAD_CONCURRENCY = 6
+DEFAULT_IMAGE_UPLOAD_TOTAL_CONCURRENCY = 12
+
+_upload_semaphore: threading.BoundedSemaphore | None = None
+_upload_semaphore_limit = 0
+_upload_semaphore_lock = threading.Lock()
 
 
 class ImageHostingError(RuntimeError):
     pass
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, value)
 
 
 def extension_from_response(url: str, content_type: str) -> str:
@@ -143,12 +158,21 @@ def upload_to_superbed(path: Path, session: requests.Session) -> str:
 
 
 def image_upload_concurrency() -> int:
-    raw_value = os.getenv("IMAGE_UPLOAD_CONCURRENCY", str(DEFAULT_IMAGE_UPLOAD_CONCURRENCY)).strip()
-    try:
-        value = int(raw_value)
-    except ValueError:
-        return DEFAULT_IMAGE_UPLOAD_CONCURRENCY
-    return max(1, value)
+    return env_int("IMAGE_UPLOAD_CONCURRENCY", DEFAULT_IMAGE_UPLOAD_CONCURRENCY)
+
+
+def image_upload_total_concurrency() -> int:
+    return env_int("IMAGE_UPLOAD_TOTAL_CONCURRENCY", DEFAULT_IMAGE_UPLOAD_TOTAL_CONCURRENCY)
+
+
+def upload_semaphore() -> threading.BoundedSemaphore:
+    global _upload_semaphore, _upload_semaphore_limit
+    limit = image_upload_total_concurrency()
+    with _upload_semaphore_lock:
+        if _upload_semaphore is None or _upload_semaphore_limit != limit:
+            _upload_semaphore = threading.BoundedSemaphore(limit)
+            _upload_semaphore_limit = limit
+        return _upload_semaphore
 
 
 def upload_one_image(index: int, image: dict[str, Any], temp_dir: Path) -> tuple[int, dict[str, Any]]:
@@ -161,8 +185,9 @@ def upload_one_image(index: int, image: dict[str, Any], temp_dir: Path) -> tuple
         return index, item
 
     try:
-        local_path, byte_count = download_image(source_url, temp_dir, session)
-        hosted_url = upload_to_superbed(local_path, session)
+        with upload_semaphore():
+            local_path, byte_count = download_image(source_url, temp_dir, session)
+            hosted_url = upload_to_superbed(local_path, session)
         item["hosted_url"] = hosted_url
         item["filename"] = local_path.name
         item["bytes"] = byte_count
