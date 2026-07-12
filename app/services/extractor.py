@@ -37,6 +37,7 @@ USER_AGENT = (
 
 MAX_PRODUCT_IMAGES = 12
 DEFAULT_RENDER_CONCURRENCY = 2
+SECOND_IMAGE_FILTER_DOMAINS = {"studio125.co.uk"}
 
 _render_semaphore: threading.BoundedSemaphore | None = None
 _render_semaphore_limit = 0
@@ -153,6 +154,17 @@ def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandi
         if previous is None or item.score > previous.score:
             best_by_key[key] = item
     return sorted(best_by_key.values(), key=lambda c: c.score, reverse=True)
+
+
+def normalized_hostname(url: str) -> str:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname[4:] if hostname.startswith("www.") else hostname
+
+
+def filter_domain_image_candidates(candidates: list[ImageCandidate], page_url: str) -> list[ImageCandidate]:
+    if normalized_hostname(page_url) in SECOND_IMAGE_FILTER_DOMAINS and len(candidates) >= 2:
+        return candidates[:1] + candidates[2:]
+    return candidates
 
 
 def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
@@ -636,6 +648,42 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
         normalize_url(meta("og:image", "twitter:image", "twitter:image:src"), base_url),
     ]
     return info, [u for u in images if u]
+
+
+def extract_nextjs_product_info(soup: BeautifulSoup) -> dict[str, Any]:
+    script_text = "\n".join(script.get_text() for script in soup.find_all("script"))
+    if "dimensions" not in script_text and "heightCm" not in script_text:
+        return {}
+
+    quote = r'(?:\\"|")'
+
+    def string_field(name: str) -> str:
+        match = re.search(rf"{quote}{re.escape(name)}{quote}\s*:\s*{quote}([^\"\\]+){quote}", script_text)
+        return clean_text(match.group(1)) if match else ""
+
+    def number_field(name: str) -> str:
+        match = re.search(rf"{quote}{re.escape(name)}{quote}\s*:\s*(-?\d+(?:\.\d+)?)", script_text)
+        return clean_text(match.group(1)) if match else ""
+
+    details: dict[str, Any] = {}
+    dimensions = string_field("dimensions")
+    if dimensions and dimensions != "$undefined":
+        details["dimensions"] = dimensions
+    for label, field_name in (
+        ("Height cm", "heightCm"),
+        ("Width cm", "widthCm"),
+        ("Depth cm", "depthCm"),
+    ):
+        value = number_field(field_name)
+        if value:
+            details[label] = value
+
+    info: dict[str, Any] = {"source": "nextjs-product-data"}
+    if details:
+        info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
+    return info
 
 
 def line_looks_like_dimensions(line: str) -> bool:
@@ -1300,12 +1348,14 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)
     shopify_info, shopify_images = try_shopify_json(final_url, session)
+    nextjs_info = extract_nextjs_product_info(soup)
 
     product_info = {}
     for info in (jsonld_info, shopify_info, meta_info):
         product_info = merge_product_info(product_info, info)
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
     product_info = merge_product_info(dom_info, product_info)
+    product_info = merge_product_info(nextjs_info, product_info)
     product_info["page_url"] = final_url
 
     structured_images = list(dict.fromkeys(jsonld_images + shopify_images))
@@ -1320,6 +1370,7 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     candidates = prefer_numbered_gallery(candidates)
     candidates = prefer_leading_filename_series(candidates)
     candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
+    candidates = filter_domain_image_candidates(candidates, final_url)
     selected = [
         {
             "url": c.url,
