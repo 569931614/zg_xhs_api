@@ -296,6 +296,7 @@ def create_xhs_response(result: Any, job_id: str) -> XHSCreateResponse:
         job_id=result.job_id,
         qrcode_image_link=result.qrcode_link,
         share_link=result.share_link,
+        xhs_link=result.share_link,
         title=result.title,
         content=result.content,
         result_path=f"/data/{job_id}/xhs_result.json",

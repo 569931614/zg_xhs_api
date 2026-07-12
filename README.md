@@ -131,6 +131,7 @@ Content-Type: application/json
   "job_id": "1783607518-7b810176bd",
   "qrcode_image_link": "https://xhspost.aivip1.top/api/html-render/qrcode?size=320&data=...",
   "share_link": "https://note.aivip1.top/#/xhs-auto-api?id=...",
+  "xhs_link": "https://note.aivip1.top/#/xhs-auto-api?id=...",
   "title": "旨丘｜...",
   "content": "旨丘在售的这...",
   "result_path": "/data/1783607518-7b810176bd/xhs_result.json"

@@ -54,6 +54,7 @@ class XHSCreateResponse(BaseModel):
     job_id: str
     qrcode_image_link: str
     share_link: str
+    xhs_link: str
     title: str = ""
     content: str = ""
     result_path: str = ""
