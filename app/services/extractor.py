@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -29,6 +30,8 @@ import requests
 from bs4 import BeautifulSoup
 
 
+logger = logging.getLogger("uvicorn.error")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -38,6 +41,20 @@ USER_AGENT = (
 MAX_PRODUCT_IMAGES = 12
 DEFAULT_RENDER_CONCURRENCY = 2
 SECOND_IMAGE_FILTER_DOMAINS = {"studio125.co.uk"}
+KNOWN_CURRENCY_CODES = {
+    "AUD",
+    "CAD",
+    "CHF",
+    "CNY",
+    "DKK",
+    "EUR",
+    "GBP",
+    "HKD",
+    "JPY",
+    "NOK",
+    "SEK",
+    "USD",
+}
 
 _render_semaphore: threading.BoundedSemaphore | None = None
 _render_semaphore_limit = 0
@@ -103,6 +120,32 @@ def clean_text(value: Any) -> str:
     return text
 
 
+def clean_price_text(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"^(regular|sale|unit|public|trade)\s+price\s*:?\s*", "", text, flags=re.I)
+    return text
+
+
+def format_shopify_price(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        cents = int(value)
+    except (TypeError, ValueError):
+        return clean_price_text(value)
+    return f"{cents / 100:.2f}"
+
+
+def clean_dimension_text(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.split(r"\bPrice\s*[:：]", text, maxsplit=1, flags=re.I)[0]
+    return clean_text(text).strip(" .;-")
+
+
 def compact_url(url: str) -> str:
     parsed = urlparse(url)
     keep_params = []
@@ -141,8 +184,8 @@ def image_identity_key(url: str) -> str:
     dirname = parts[0] if len(parts) == 2 else ""
     filename = unquote(parts[-1] if parts else path).lower()
     stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
-    stem = re.sub(r"-(?:\d{2,5}x\d{2,5}|scaled)$", "", stem, flags=re.I)
-    stem = re.sub(r"-(?:600|804|1026|1281|1536|1920)$", "", stem, flags=re.I)
+    stem = re.sub(r"[_-](?:\d{2,5}x\d{2,5}|\d{2,5}x(?:-q\d{1,3})?|scaled)$", "", stem, flags=re.I)
+    stem = re.sub(r"[_-](?:600|804|1026|1080x?|1281|1536|1800x?|1920|2000x?)$", "", stem, flags=re.I)
     return f"{parsed.netloc}{dirname}/{stem}".lower()
 
 
@@ -165,6 +208,25 @@ def filter_domain_image_candidates(candidates: list[ImageCandidate], page_url: s
     if normalized_hostname(page_url) in SECOND_IMAGE_FILTER_DOMAINS and len(candidates) >= 2:
         return candidates[:1] + candidates[2:]
     return candidates
+
+
+def prefer_page_path_images(candidates: list[ImageCandidate], page_url: str) -> list[ImageCandidate]:
+    parsed = urlparse(page_url)
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if not path_parts:
+        return candidates
+    slug = path_parts[-1].lower()
+    if len(slug) < 8 or not re.search(r"[a-z]", slug):
+        return candidates
+    matched = [
+        item
+        for item in candidates
+        if slug in unquote(urlparse(url_for_series(item.url)).path).lower()
+    ]
+    if len(matched) < 3:
+        return candidates
+    matched_ids = {id(item) for item in matched}
+    return matched + [item for item in candidates if id(item) not in matched_ids and item.source == "structured"]
 
 
 def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
@@ -215,6 +277,30 @@ def prefer_leading_filename_series(candidates: list[ImageCandidate]) -> list[Ima
     return candidates
 
 
+def prefer_early_product_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    useful = [
+        item
+        for item in candidates
+        if item.score >= 25 and item.order < 100_000 and not re.search(r"\.(svg|gif)(\?|$)", urlparse(item.url).path, re.I)
+    ]
+    if len(useful) < 8:
+        return candidates
+    first_order = min(item.order for item in useful)
+    early = [item for item in useful if item.order <= first_order + 12]
+    if len(early) < 4:
+        return candidates
+    groups: dict[str, list[ImageCandidate]] = {}
+    for item in early:
+        parsed = urlparse(url_for_series(item.url))
+        groups.setdefault(f"{parsed.netloc}{parsed.path.rsplit('/', 1)[0]}", []).append(item)
+    best_group = max(groups.values(), key=lambda group: (len(group), -min(item.order for item in group)))
+    if len(best_group) < 4:
+        return candidates
+    early_ids = {id(item) for item in best_group}
+    early_sorted = sorted(best_group, key=lambda item: (item.order, -item.score))
+    return early_sorted + [item for item in candidates if id(item) not in early_ids and item.source == "structured"]
+
+
 def normalize_match_text(value: str) -> str:
     value = clean_product_title(value)
     value = re.sub(r"\.(jpe?g|png|webp|avif)$", "", value, flags=re.I)
@@ -243,8 +329,8 @@ def image_series_key(item: ImageCandidate) -> str:
     if not re.search(r"\.(jpe?g|png|webp|avif)$", filename, re.I):
         return ""
     stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
-    stem = re.sub(r"-(?:\d{2,5}x\d{2,5}|scaled)$", "", stem, flags=re.I)
-    stem = re.sub(r"-(?:600|804|1026|1281|1536|1920)$", "", stem, flags=re.I)
+    stem = re.sub(r"[_-](?:\d{2,5}x\d{2,5}|\d{2,5}x(?:-q\d{1,3})?|scaled)$", "", stem, flags=re.I)
+    stem = re.sub(r"[_-](?:600|804|1026|1080x?|1281|1536|1800x?|1920|2000x?)$", "", stem, flags=re.I)
     if re.match(r"^(?:img|dsc|dscf|dscn|pict|photo)[_-]?\d{3,6}$", stem, re.I):
         return f"{parsed.netloc}{path.rsplit('/', 1)[0]}/camera-sequence"
     if re.search(r"(screenshot|skærmbillede|screen-shot|whatsapp|instagram)", stem, re.I):
@@ -386,7 +472,9 @@ def normalize_url(raw: str, base_url: str) -> str:
     raw = raw.strip().strip("'\"")
     if raw.startswith("//"):
         raw = "https:" + raw
-    return compact_url(urljoin(base_url, raw))
+    url = urljoin(base_url, raw)
+    url = url_for_series(url)
+    return compact_url(url)
 
 
 def pick_srcset_best(srcset: str) -> str:
@@ -473,11 +561,18 @@ def clean_product_title(title: str) -> str:
     if not title:
         return ""
     separators = [" — ", " – ", " - ", " | "]
-    suffix_noise = re.compile(r"(gallery|galerie|shop|store|collectibles|design|mobilia)", re.I)
+    suffix_noise = re.compile(
+        r"(gallery|galleria|galerie|shop|store|collectibles|design|mobilia|"
+        r"mdrn|modern living|atkris|objekt|béton brut|beton brut|daddy deco|"
+        r"paulette|approved|spazio leone|the oblist|envan rijn)",
+        re.I,
+    )
     for separator in separators:
         parts = [part.strip() for part in title.split(separator) if part.strip()]
         if len(parts) >= 2 and suffix_noise.search(parts[-1]):
-            return parts[0]
+            title = clean_text(separator.join(parts[:-1]))
+            break
+    title = re.sub(r"\s+[£$€]\s?[\d,.]+(?:\s*[A-Z]{3})?$", "", title).strip()
     return title
 
 
@@ -537,7 +632,7 @@ def details_from_property_values(value: Any) -> dict[str, Any]:
 
 def is_weak_existing_name(name: str) -> bool:
     normalized = clean_text(name).lower()
-    if normalized in {"", "shop", "store", "home", "monument"}:
+    if normalized in {"", "shop", "store", "home", "monument", "spazio leone"}:
         return True
     return bool(
         re.search(
@@ -574,11 +669,11 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                     "reviewCount": rating.get("reviewCount") or rating.get("ratingCount"),
                 }
             current = {
-                "name": clean_text(item.get("name")),
+                "name": clean_product_title(clean_text(item.get("name"))),
                 "description": clean_text(item.get("description")),
                 "sku": clean_text(item.get("sku") or item.get("mpn")),
                 "brand": clean_text(brand),
-                "price": clean_text(offer0.get("price")),
+                "price": clean_price_text(offer0.get("price")),
                 "currency": clean_text(offer0.get("priceCurrency")),
                 "availability": clean_text(offer0.get("availability")),
                 "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
@@ -603,6 +698,7 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
             details.update(details_from_property_values(item.get("additionalProperty")))
             if details:
                 current["details"] = details
+            add_synthesized_dimensions(current)
             product_info = merge_product_info(product_info, current)
             product_images.extend(extract_image_urls(item.get("image"), base_url))
     return product_info, list(dict.fromkeys(product_images))
@@ -636,6 +732,9 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
         return ""
 
     title = clean_product_title(meta("og:title", "twitter:title") or clean_text(soup.title.string if soup.title else ""))
+    fallback_title = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    if is_weak_existing_name(title) and fallback_title:
+        title = fallback_title
     description = meta("og:description", "description", "twitter:description")
     canonical = soup.find("link", attrs={"rel": re.compile("canonical", re.I)})
     info = {
@@ -644,6 +743,12 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
         "url": normalize_url(canonical.get("href"), base_url) if canonical else base_url,
         "source": "meta",
     }
+    price = meta("product:price:amount", "og:price:amount")
+    currency = meta("product:price:currency", "og:price:currency")
+    if price:
+        info["price"] = clean_price_text(price)
+    if currency:
+        info["currency"] = clean_text(currency).upper()
     images = [
         normalize_url(meta("og:image", "twitter:image", "twitter:image:src"), base_url),
     ]
@@ -687,16 +792,140 @@ def extract_nextjs_product_info(soup: BeautifulSoup) -> dict[str, Any]:
 
 
 def line_looks_like_dimensions(line: str) -> bool:
+    line = clean_dimension_text(line)
+    if not line or len(line) > 240:
+        return False
+    if re.search(r"(http|copyright|cookie|newsletter|shipping|delivery|email|vat)", line, re.I):
+        return False
+    has_unit = bool(re.search(r"(?:cm|mm|in|inch|inches|m)\b|″|”", line, re.I))
+    if not has_unit:
+        return False
     return bool(
-        re.search(r"\b(?:W|D|H|L|Dia|Diameter)\.?\s*\d", line, re.I)
-        and re.search(r"\b(?:cm|mm|in|inch|inches|m)\b", line, re.I)
+        re.search(
+            r"\b(?:W|D|H|L|SH|AH|Dia|Diameter|Height|Width|Depth|Length|Seat\s+height)\.?\s*[:=\-]?\s*\d",
+            line,
+            re.I,
+        )
+        or re.search(
+            r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m)?\s*(?:x|×)\s*"
+            r"\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|in|inch|inches|m))?",
+            line,
+            re.I,
+        )
+        or re.search(r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m)\s*\([hwdbl]\)", line, re.I)
     )
+
+
+def extract_dimensions_from_text(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    measurement_in_cm = re.search(
+        r"\b(?:Measurements?\s+)?in\s+cm\s+"
+        r"\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?h?\b",
+        text,
+        re.I,
+    )
+    if measurement_in_cm:
+        return clean_text(measurement_in_cm.group(0))
+    labeled = re.search(
+        r"(Dimensions?|Measurements?|Size)\s*[;:,-]?\s*"
+        r"(.{0,180}?\d(?:[^.!?;]|[x×;,-]){0,180}?(?:cm|mm|in|inch|inches|″|”))",
+        text,
+        re.I,
+    )
+    if labeled:
+        candidate = clean_dimension_text(labeled.group(2))
+        if line_looks_like_dimensions(candidate):
+            return candidate
+
+    sentence_candidates = re.split(r"(?<=[.!?])\s+", text)
+    for sentence in sentence_candidates:
+        if line_looks_like_dimensions(sentence):
+            return clean_dimension_text(sentence)
+    return ""
+
+
+def extract_dimensions_from_lines(lines: list[str]) -> str:
+    groups: list[list[str]] = []
+    current: list[str] = []
+    previous_was_label = False
+    for line in lines:
+        normalized = clean_text(line)
+        if not normalized:
+            continue
+        label_only = bool(re.match(r"^(Dimensions?|Measurements?|Measurement|Size|Sizes)\s*:?\s*$", normalized, re.I))
+        same_line = re.match(r"^(Dimensions?|Measurements?|Measurement|Size|Sizes)\s*[;:]\s*(.+)$", normalized, re.I)
+        value = clean_dimension_text(same_line.group(2)) if same_line else clean_dimension_text(normalized)
+        looks_like = line_looks_like_dimensions(value)
+        if same_line and looks_like:
+            groups.append([value])
+            current = []
+            previous_was_label = False
+            continue
+        if looks_like and (
+            previous_was_label
+            or re.match(
+                r"^[•\-–]?\s*(?:\d+\s+)?(?:H|W|D|L|SH|AH|Height|Width|Depth|Length|Seat|[A-Z][A-Za-z ]{1,40}\s+[–-])",
+                value,
+                re.I,
+            )
+            or re.search(r"\d\s*(?:x|×)\s*\d", value, re.I)
+        ):
+            current.append(value)
+            previous_was_label = False
+            continue
+        if current:
+            groups.append(current)
+            current = []
+        previous_was_label = label_only
+    if current:
+        groups.append(current)
+
+    if not groups:
+        return ""
+    best = max(groups, key=lambda group: (len(group), sum(len(item) for item in group)))
+    return clean_text("; ".join(best[:6]))
+
+
+def add_synthesized_dimensions(info: dict[str, Any]) -> None:
+    details = info.get("details") if isinstance(info.get("details"), dict) else {}
+    if info.get("dimensions") or details.get("dimensions"):
+        return
+
+    dimensions = extract_dimensions_from_text(str(info.get("description") or ""))
+    if not dimensions:
+        ordered_parts = []
+        for key in ("Height", "Width", "Depth", "Length", "Seat Height", "Seat height"):
+            value = details.get(key)
+            if value:
+                ordered_parts.append(f"{key}: {value}")
+        if len(ordered_parts) >= 2:
+            dimensions = " x ".join(ordered_parts)
+    if dimensions:
+        details = dict(details)
+        details["dimensions"] = dimensions
+        info["details"] = details
+        info["dimensions"] = dimensions
+
+
+def line_looks_like_price(line: str) -> bool:
+    line = clean_price_text(line)
+    if not line or len(line) > 120:
+        return False
+    if re.search(r"(newsletter|receive|recieve|updated|shipping|delivery|transport|cookie|country|row\s+\d+)", line, re.I):
+        return False
+    if re.match(r"^(POA|PRICE ON APPLICATION|INQUIRE FOR PRICING(?: AND SHIPPING COSTS)?|LOGIN TO VIEW PRICE)$", line, re.I):
+        return True
+    if re.match(r"^[£$€]\s?[\d,.]+(?:\s*(?:No VAT|incl\.?\s*VAT|excl\.?\s*VAT|EUR|USD|GBP|SEK))?$", line, re.I):
+        return True
+    code_match = re.match(r"^([A-Z]{3})\s?[\d,.]+(?:\s*(?:incl\.?\s*VAT|excl\.?\s*VAT|No VAT))?$", line)
+    return bool(code_match and code_match.group(1) in KNOWN_CURRENCY_CODES)
 
 
 def extract_heading_text_block(
     soup: BeautifulSoup,
     product_name: str,
-    price_re: re.Pattern[str],
     nav_words: set[str],
 ) -> dict[str, Any]:
     if not product_name:
@@ -741,8 +970,8 @@ def extract_heading_text_block(
     price = ""
     content_lines: list[str] = []
     for line in block_lines:
-        if price_re.search(line):
-            price = line
+        if line_looks_like_price(line):
+            price = clean_price_text(line)
             break
         if re.search(r"^(ENQUIRE|SOLD|ADD TO CART|BUY NOW)$", line, re.I):
             break
@@ -752,7 +981,7 @@ def extract_heading_text_block(
     description_lines: list[str] = []
     for line in content_lines:
         if line_looks_like_dimensions(line):
-            details.setdefault("dimensions", line)
+            details.setdefault("dimensions", clean_dimension_text(line))
             continue
         seat_height = re.match(r"^(Seat\s+height)\s*:?\s*(.+)$", line, re.I)
         if seat_height:
@@ -772,6 +1001,7 @@ def extract_heading_text_block(
         info["details"] = details
     if details.get("dimensions"):
         info["dimensions"] = str(details["dimensions"])
+    add_synthesized_dimensions(info)
     return info
 
 
@@ -811,9 +1041,13 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     }
 
     price_index = None
-    price_re = re.compile(r"^(POA|PRICE ON APPLICATION)$|^[£$€]\s?[\d,.]+|^[A-Z]{3}\s?[\d,.]+", re.I)
     for index, line in enumerate(lines):
-        if price_re.search(line):
+        nearby = " ".join(lines[max(0, index - 5) : index + 5])
+        if line_looks_like_price(line) and not re.search(
+            r"(shipment costs|shipping|delivery time|transport prices|european union|united kingdom|united states|china)",
+            nearby,
+            re.I,
+        ):
             price_index = index
             break
 
@@ -853,8 +1087,11 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         if h1:
             name = clean_text(h1.get_text(" "))
     name = clean_product_title(name)
+    title_name = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    if title_name and is_weak_existing_name(name):
+        name = title_name
 
-    price = lines[price_index] if price_index is not None else ""
+    price = clean_price_text(lines[price_index]) if price_index is not None else ""
     labels = [
         "Designer",
         "Manufacturer",
@@ -876,6 +1113,10 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     def add_detail(label: Any, value: Any) -> None:
         detail_key = normalize_detail_label(clean_detail_key(label))
         detail_value = clean_detail_value(value)
+        if detail_key == "dimensions":
+            detail_value = clean_dimension_text(detail_value)
+            if str(detail_value).lower() in {"soon", "coming soon", "n/a", "na", "none", "-"}:
+                return
         if (
             not detail_key
             or detail_value in (None, "", [], {})
@@ -930,7 +1171,14 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                     add_detail(detail_key, value)
                     break
 
-    heading_info = extract_heading_text_block(soup, name, price_re, nav_words)
+    dimensions_from_lines = extract_dimensions_from_lines(lines)
+    existing_dimensions = str(details.get("dimensions") or "")
+    if dimensions_from_lines and (
+        not existing_dimensions or dimensions_from_lines.count(";") > existing_dimensions.count(";")
+    ):
+        details["dimensions"] = dimensions_from_lines
+
+    heading_info = extract_heading_text_block(soup, name, nav_words)
 
     description = ""
     if price_index is not None:
@@ -978,6 +1226,7 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         info["details"] = details
     if details.get("dimensions"):
         info["dimensions"] = str(details["dimensions"])
+    add_synthesized_dimensions(info)
     return info
 
 
@@ -989,7 +1238,21 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
     endpoint = urlunparse((parsed.scheme, parsed.netloc, match.group(1) + ".js", "", "", ""))
     try:
         response = session.get(endpoint, timeout=20)
-        if response.status_code != 200 or "json" not in response.headers.get("content-type", ""):
+        if response.status_code in {401, 403, 429}:
+            try:
+                from curl_cffi import requests as curl_requests
+
+                response = curl_requests.get(
+                    endpoint,
+                    headers={**dict(session.headers), "Accept": "application/json,text/javascript,*/*"},
+                    impersonate="chrome120",
+                    timeout=20,
+                    allow_redirects=True,
+                )
+            except Exception:
+                return {}, []
+        content_type = response.headers.get("content-type", "")
+        if response.status_code != 200 or not re.search(r"(json|javascript|text/plain)", content_type, re.I):
             return {}, []
         product = response.json()
     except Exception:
@@ -1007,6 +1270,8 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
         "name": clean_text(product.get("title")),
         "description": clean_text(BeautifulSoup(product.get("description") or "", "lxml").get_text(" ")),
         "sku": clean_text(first_variant.get("sku")),
+        "price": format_shopify_price(product.get("price") or first_variant.get("price")),
+        "currency": clean_text(product.get("currency") or first_variant.get("currency")).upper(),
         "url": endpoint.removesuffix(".js"),
         "source": "shopify-product-json",
     }
@@ -1016,6 +1281,7 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
     )
     if details:
         info["details"] = details
+    add_synthesized_dimensions(info)
     return info, [u for u in images if u]
 
 
@@ -1126,6 +1392,62 @@ def try_monument_airtable_api(
     }
 
 
+def extract_auctionet_page_data(soup: BeautifulSoup) -> dict[str, Any]:
+    script_text = "\n".join(script.get_text() for script in soup.find_all("script"))
+    marker = "window.vipDataAtPageLoad"
+    marker_index = script_text.find(marker)
+    if marker_index < 0:
+        return {}
+    assignment_index = script_text.find("=", marker_index)
+    if assignment_index < 0:
+        return {}
+    try:
+        data, _ = json.JSONDecoder().raw_decode(script_text[assignment_index + 1 :].lstrip())
+    except json.JSONDecodeError:
+        return {}
+    item = data.get("item") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        return {}
+
+    info: dict[str, Any] = {"source": "auctionet-page-data"}
+    h1 = soup.find("h1")
+    if h1:
+        info["name"] = clean_product_title(clean_text(h1.get_text(" ")))
+    currency = clean_text(item.get("currency")).upper()
+    if currency:
+        info["currency"] = currency
+    if item.get("estimate") not in (None, ""):
+        info["price"] = f"Estimate {item['estimate']}"
+
+    details = details_from_mapping(
+        item,
+        {
+            "id",
+            "auction_id",
+            "currency",
+            "reserve_met",
+            "publicly_visible",
+            "license_weapon",
+            "you_have_license_weapon_bidding_enabled",
+            "reason_for_not_being_able_to_bid",
+        },
+    )
+    description = ""
+    meta_description = soup.find("meta", attrs={"property": "og:description"}) or soup.find(
+        "meta", attrs={"name": "description"}
+    )
+    if meta_description and meta_description.get("content"):
+        description = clean_text(meta_description["content"])
+        info["description"] = description
+    dimensions = extract_dimensions_from_text(description)
+    if dimensions:
+        details["dimensions"] = dimensions
+        info["dimensions"] = dimensions
+    if details:
+        info["details"] = details
+    return info
+
+
 def infer_context_score(element: Any) -> tuple[int, list[str]]:
     score = 0
     reasons: list[str] = []
@@ -1165,6 +1487,8 @@ def add_candidate(
 ) -> None:
     url = normalize_url(raw_url, base_url)
     if not url or url.startswith("data:"):
+        return
+    if "{" in url or "}" in url:
         return
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
@@ -1246,6 +1570,7 @@ def gather_image_candidates(
 
 
 def fetch_static(url: str) -> tuple[str, str]:
+    started = time.monotonic()
     parsed = urlparse(url)
     if parsed.scheme == "file":
         path = Path(url2pathname(parsed.path))
@@ -1253,6 +1578,7 @@ def fetch_static(url: str) -> tuple[str, str]:
             path = Path(f"//{parsed.netloc}") / str(path).lstrip("\\/")
         return path.read_text(encoding="utf-8"), url
 
+    logger.info("extractor stage=fetch_static_start host=%s path=%s", parsed.netloc, parsed.path or "/")
     session = requests.Session()
     session.headers.update(
         {
@@ -1263,10 +1589,21 @@ def fetch_static(url: str) -> tuple[str, str]:
         }
     )
     response = session.get(url, timeout=30)
+    logger.info(
+        "extractor stage=fetch_static_response host=%s status=%d elapsed=%.2fs",
+        parsed.netloc,
+        response.status_code,
+        time.monotonic() - started,
+    )
     if response.status_code in {401, 403, 429}:
         try:
             from curl_cffi import requests as curl_requests
 
+            logger.warning(
+                "extractor stage=fetch_static_retry_curl host=%s status=%d",
+                parsed.netloc,
+                response.status_code,
+            )
             curl_response = curl_requests.get(
                 url,
                 headers=dict(session.headers),
@@ -1275,10 +1612,23 @@ def fetch_static(url: str) -> tuple[str, str]:
                 allow_redirects=True,
             )
             if curl_response.status_code < 400:
+                logger.info(
+                    "extractor stage=fetch_static_curl_done host=%s status=%d elapsed=%.2fs",
+                    parsed.netloc,
+                    curl_response.status_code,
+                    time.monotonic() - started,
+                )
                 return curl_response.text, curl_response.url
         except Exception:
+            logger.exception("extractor stage=fetch_static_curl_failed host=%s", parsed.netloc)
             pass
     response.raise_for_status()
+    logger.info(
+        "extractor stage=fetch_static_done host=%s bytes=%d elapsed=%.2fs",
+        parsed.netloc,
+        len(response.text),
+        time.monotonic() - started,
+    )
     return response.text, response.url
 
 
@@ -1288,7 +1638,16 @@ def fetch_rendered(url: str) -> tuple[str, str]:
     except ImportError as exc:
         raise RuntimeError("Playwright is not installed. Run without --render or install playwright.") from exc
 
+    parsed = urlparse(url)
+    wait_started = time.monotonic()
+    logger.info("extractor stage=fetch_rendered_queued host=%s path=%s", parsed.netloc, parsed.path or "/")
     with render_semaphore():
+        started = time.monotonic()
+        logger.info(
+            "extractor stage=fetch_rendered_start host=%s queue_wait=%.2fs",
+            parsed.netloc,
+            started - wait_started,
+        )
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
@@ -1303,6 +1662,12 @@ def fetch_rendered(url: str) -> tuple[str, str]:
                 final_url = page.url
             finally:
                 browser.close()
+    logger.info(
+        "extractor stage=fetch_rendered_done host=%s bytes=%d elapsed=%.2fs",
+        parsed.netloc,
+        len(html),
+        time.monotonic() - started,
+    )
     return html, final_url
 
 
@@ -1331,11 +1696,26 @@ def download_images(images: list[dict[str, Any]], out_dir: Path, session: reques
 
 
 def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str, Any]:
+    started = time.monotonic()
     max_images = max(1, min(max_images, MAX_PRODUCT_IMAGES))
+    parsed = urlparse(url)
+    logger.info(
+        "extractor event=started host=%s render=%s max_images=%d min_score=%d",
+        parsed.netloc,
+        render,
+        max_images,
+        min_score,
+    )
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
     fast_result = try_monument_airtable_api(url, session, max_images)
     if fast_result and fast_result.get("product", {}).get("dimensions"):
+        logger.info(
+            "extractor event=done host=%s source=monument_airtable images=%d elapsed=%.2fs",
+            parsed.netloc,
+            len(fast_result.get("images") or []),
+            time.monotonic() - started,
+        )
         return fast_result
 
     html, final_url = fetch_rendered(url) if render else fetch_static(url)
@@ -1343,12 +1723,14 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     page_title = clean_text(soup.title.string if soup.title else "")
     body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
     if page_title.lower() == "just a moment..." or "performing security verification" in body_text.lower():
+        logger.warning("extractor event=blocked host=%s final_url=%s title=%r", parsed.netloc, final_url, page_title)
         raise RuntimeError("Blocked by Cloudflare/security verification page")
 
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)
     shopify_info, shopify_images = try_shopify_json(final_url, session)
     nextjs_info = extract_nextjs_product_info(soup)
+    auctionet_info = extract_auctionet_page_data(soup)
 
     product_info = {}
     for info in (jsonld_info, shopify_info, meta_info):
@@ -1356,6 +1738,8 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
     product_info = merge_product_info(dom_info, product_info)
     product_info = merge_product_info(nextjs_info, product_info)
+    product_info = merge_product_info(auctionet_info, product_info)
+    add_synthesized_dimensions(product_info)
     product_info["page_url"] = final_url
 
     structured_images = list(dict.fromkeys(jsonld_images + shopify_images))
@@ -1369,7 +1753,9 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     candidates = dedupe_image_candidates(candidates)
     candidates = prefer_numbered_gallery(candidates)
     candidates = prefer_leading_filename_series(candidates)
+    candidates = prefer_early_product_gallery(candidates)
     candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
+    candidates = prefer_page_path_images(candidates, final_url)
     candidates = filter_domain_image_candidates(candidates, final_url)
     selected = [
         {
@@ -1385,6 +1771,16 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
         if c.score >= min_score
     ][:max_images]
 
+    logger.info(
+        "extractor event=done host=%s final_host=%s render=%s candidates=%d selected=%d name=%r elapsed=%.2fs",
+        parsed.netloc,
+        urlparse(final_url).netloc,
+        render,
+        len(candidates),
+        len(selected),
+        product_info.get("name", ""),
+        time.monotonic() - started,
+    )
     return {
         "input_url": url,
         "fetched_url": final_url,
