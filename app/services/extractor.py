@@ -146,10 +146,15 @@ def clean_dimension_text(value: Any) -> str:
     return clean_text(text).strip(" .;-")
 
 
+def is_next_image_proxy_path(path: str) -> bool:
+    normalized = path.rstrip("/")
+    return normalized.endswith("/_next/image") or normalized.endswith("/_vercel/image")
+
+
 def compact_url(url: str) -> str:
     parsed = urlparse(url)
     keep_params = []
-    if parsed.path.rstrip("/").endswith("/_next/image"):
+    if is_next_image_proxy_path(parsed.path):
         keep_names = {"url", "w", "q", "width", "height", "format", "quality"}
     else:
         keep_names = {"v", "width", "height", "format", "quality"}
@@ -170,7 +175,7 @@ def compact_url(url: str) -> str:
 
 def image_identity_key(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.path.rstrip("/").endswith("/_next/image"):
+    if is_next_image_proxy_path(parsed.path):
         params = dict(parse_qsl(parsed.query, keep_blank_values=True))
         nested_url = params.get("url")
         if nested_url:
@@ -314,7 +319,7 @@ def name_tokens(value: str) -> set[str]:
 
 def url_for_series(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.path.rstrip("/").endswith("/_next/image"):
+    if is_next_image_proxy_path(parsed.path):
         params = dict(parse_qsl(parsed.query, keep_blank_values=True))
         nested_url = params.get("url")
         if nested_url:
