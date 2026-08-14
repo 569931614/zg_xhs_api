@@ -109,6 +109,11 @@ button:disabled {
   color: #4d473e;
 }
 
+.price {
+  font-weight: 700;
+  color: #285c45;
+}
+
 .details {
   display: grid;
   grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);

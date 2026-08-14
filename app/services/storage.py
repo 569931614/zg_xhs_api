@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import mimetypes
 import os
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import requests
+from PIL import Image, ImageOps
 
 
 USER_AGENT = (
@@ -21,8 +24,11 @@ USER_AGENT = (
 
 DEFAULT_SUPERBED_UPLOAD_URL = "https://api.superbed.cc/upload"
 DEFAULT_MAX_IMAGE_BYTES = 30 * 1024 * 1024
+DEFAULT_OPTIMIZE_MIN_BYTES = 1500 * 1024
+DEFAULT_OPTIMIZE_MAX_DIMENSION = 1600
 DEFAULT_IMAGE_UPLOAD_CONCURRENCY = 6
 DEFAULT_IMAGE_UPLOAD_TOTAL_CONCURRENCY = 12
+logger = logging.getLogger("uvicorn.error")
 
 _upload_semaphore: threading.BoundedSemaphore | None = None
 _upload_semaphore_limit = 0
@@ -133,6 +139,36 @@ def download_image(url: str, target_dir: Path, session: requests.Session) -> tup
     return target_path, total
 
 
+def optimize_image_for_upload(path: Path, original_bytes: int) -> tuple[Path, int]:
+    min_bytes = env_int("IMAGE_UPLOAD_OPTIMIZE_MIN_BYTES", DEFAULT_OPTIMIZE_MIN_BYTES)
+    max_dimension = env_int("IMAGE_UPLOAD_MAX_DIMENSION", DEFAULT_OPTIMIZE_MAX_DIMENSION)
+    if original_bytes < min_bytes:
+        return path, original_bytes
+
+    try:
+        image = Image.open(path)
+        image = ImageOps.exif_transpose(image)
+        if image.mode in {"RGBA", "LA"}:
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image, mask=image.getchannel("A"))
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+
+        width, height = image.size
+        if max(width, height) > max_dimension:
+            image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+
+        optimized_path = path.with_suffix(".optimized.jpg")
+        image.save(optimized_path, "JPEG", quality=88, optimize=True, progressive=True)
+        optimized_bytes = optimized_path.stat().st_size
+        if optimized_bytes < original_bytes:
+            return optimized_path, optimized_bytes
+    except Exception:
+        logger.exception("image_upload event=optimize_failed path=%s", path)
+    return path, original_bytes
+
+
 def upload_to_superbed(path: Path, session: requests.Session) -> str:
     upload_url = superbed_upload_url()
     categories = os.getenv("SUPERBED_CATEGORIES", "").strip()
@@ -175,29 +211,68 @@ def upload_semaphore() -> threading.BoundedSemaphore:
         return _upload_semaphore
 
 
-def upload_one_image(index: int, image: dict[str, Any], temp_dir: Path) -> tuple[int, dict[str, Any]]:
+def upload_one_image(
+    index: int,
+    image: dict[str, Any],
+    temp_dir: Path,
+    request_id_value: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    started = time.monotonic()
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
     item = dict(image)
     source_url = str(item.get("url") or "")
     if not source_url:
         item["upload_error"] = "Missing image URL"
+        logger.warning(
+            "image_upload event=failed request_id=%s index=%d reason=missing_url elapsed=%.2fs",
+            request_id_value,
+            index,
+            time.monotonic() - started,
+        )
         return index, item
 
     try:
+        logger.info(
+            "image_upload event=started request_id=%s index=%d source_host=%s",
+            request_id_value,
+            index,
+            urlparse(source_url).netloc,
+        )
         with upload_semaphore():
             local_path, byte_count = download_image(source_url, temp_dir, session)
-            hosted_url = upload_to_superbed(local_path, session)
+            upload_path, upload_byte_count = optimize_image_for_upload(local_path, byte_count)
+            hosted_url = upload_to_superbed(upload_path, session)
         item["hosted_url"] = hosted_url
-        item["filename"] = local_path.name
+        item["filename"] = upload_path.name
         item["bytes"] = byte_count
+        item["upload_bytes"] = upload_byte_count
+        logger.info(
+            "image_upload event=done request_id=%s index=%d bytes=%d upload_bytes=%d elapsed=%.2fs",
+            request_id_value,
+            index,
+            byte_count,
+            upload_byte_count,
+            time.monotonic() - started,
+        )
     except Exception as exc:
         item["hosted_url"] = item.get("hosted_url") or source_url
         item["upload_error"] = str(exc)
+        logger.exception(
+            "image_upload event=failed request_id=%s index=%d source_host=%s elapsed=%.2fs",
+            request_id_value,
+            index,
+            urlparse(source_url).netloc,
+            time.monotonic() - started,
+        )
     return index, item
 
 
-def upload_images_to_superbed(images: list[dict[str, Any]], temp_dir: Path) -> list[dict[str, Any]]:
+def upload_images_to_superbed(
+    images: list[dict[str, Any]],
+    temp_dir: Path,
+    request_id_value: str | None = None,
+) -> list[dict[str, Any]]:
     if not images:
         return []
 
@@ -205,14 +280,27 @@ def upload_images_to_superbed(images: list[dict[str, Any]], temp_dir: Path) -> l
         temp_dir.mkdir(parents=True, exist_ok=True)
         results: list[dict[str, Any] | None] = [None] * len(images)
         max_workers = min(image_upload_concurrency(), len(images))
+        logger.info(
+            "image_upload_batch event=started request_id=%s images=%d workers=%d",
+            request_id_value,
+            len(images),
+            max_workers,
+        )
+        started = time.monotonic()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(upload_one_image, index, image, temp_dir)
+                executor.submit(upload_one_image, index, image, temp_dir, request_id_value)
                 for index, image in enumerate(images)
             ]
             for future in as_completed(futures):
                 index, item = future.result()
                 results[index] = item
+        logger.info(
+            "image_upload_batch event=done request_id=%s images=%d elapsed=%.2fs",
+            request_id_value,
+            len(images),
+            time.monotonic() - started,
+        )
         return [item for item in results if item is not None]
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

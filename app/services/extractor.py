@@ -41,6 +41,10 @@ USER_AGENT = (
 MAX_PRODUCT_IMAGES = 12
 DEFAULT_RENDER_CONCURRENCY = 2
 SECOND_IMAGE_FILTER_DOMAINS = {"studio125.co.uk"}
+EARLY_GALLERY_FILTER_DOMAINS = {"pauletteintstad.com"}
+PRIMARY_GALLERY_ONLY_DOMAINS = {"ancien.co.uk", "pauletteintstad.com"}
+HASH_PROJECT_ROUTE_DOMAINS = {"sauceldn.com"}
+ATKRIS_PRODUCT_IMAGE_DOMAINS = {"atkris.com"}
 KNOWN_CURRENCY_CODES = {
     "AUD",
     "CAD",
@@ -64,7 +68,8 @@ NOISE_RE = re.compile(
     r"(logo|icon|sprite|avatar|payment|paypal|visa|mastercard|amex|klarna|"
     r"afterpay|trust|badge|seal|banner|hero|background|bg-|newsletter|"
     r"social|facebook|instagram|tiktok|youtube|pinterest|review|star|"
-    r"flag|placeholder|loading|spinner|favicon)",
+    r"flag|placeholder|loading|spinner|favicon|screenshot|app[-_ ]?store|"
+    r"mobile[-_ ]?app)",
     re.I,
 )
 
@@ -124,8 +129,55 @@ def clean_price_text(value: Any) -> str:
     text = clean_text(value)
     if not text:
         return ""
-    text = re.sub(r"^(regular|sale|unit|public|trade)\s+price\s*:?\s*", "", text, flags=re.I)
+    text = re.sub(r"\b(?:euros?|euro)\b", "EUR", text, flags=re.I)
+    text = re.sub(r"(\d)\s*[,.-]+\s*(?=EUR\b)", r"\1 ", text, flags=re.I)
+    text = re.sub(r"(\d)\s*[,.-]\s*-$", r"\1", text)
+    text = re.sub(
+        r"^(regular|sale|unit|public|trade|asking|retail|list|listed)\s+price\s*:?\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^(price|prix|preis|precio|prezzo)\s*:?\s*", "", text, flags=re.I)
+    listed_price = re.match(
+        r"^((?:[£$€]\s*\d[\d\s,.]*)|(?:[A-Z]{3}\s*\d[\d\s,.]*))\s*(?:[|·•/].*)?$",
+        text,
+    )
+    if listed_price:
+        return clean_text(listed_price.group(1))
     return text
+
+
+def price_amount(value: Any) -> float | None:
+    text = clean_price_text(value)
+    match = re.search(r"\d[\d\s.,]*", text)
+    if not match:
+        return None
+    number = re.sub(r"\s+", "", match.group(0))
+    if "," in number and "." in number:
+        if number.rfind(",") > number.rfind("."):
+            number = number.replace(".", "").replace(",", ".")
+        else:
+            number = number.replace(",", "")
+    elif "," in number:
+        parts = number.split(",")
+        number = "".join(parts) if len(parts[-1]) == 3 else number.replace(",", ".")
+    elif "." in number:
+        parts = number.split(".")
+        if len(parts) > 2 or len(parts[-1]) == 3:
+            number = "".join(parts)
+    try:
+        return float(number)
+    except ValueError:
+        return None
+
+
+def price_is_valid(value: Any) -> bool:
+    text = clean_price_text(value).lower()
+    if re.search(r"\b(?:login|request|estimate|estimated|sold|on request|upon request|contact|enquire|inquire)\b", text):
+        return False
+    amount = price_amount(text)
+    return amount is not None and amount > 0
 
 
 def format_shopify_price(value: Any) -> str:
@@ -181,6 +233,9 @@ def image_identity_key(url: str) -> str:
         if nested_url:
             return image_identity_key(urljoin(url, nested_url))
     path = parsed.path
+    shopify_key = shopify_image_identity_key(parsed)
+    if shopify_key:
+        return shopify_key
     if "static.wixstatic.com" in parsed.netloc and "/media/" in path:
         media_id = path.split("/media/", 1)[1].split("/", 1)[0]
         if media_id:
@@ -192,6 +247,35 @@ def image_identity_key(url: str) -> str:
     stem = re.sub(r"[_-](?:\d{2,5}x\d{2,5}|\d{2,5}x(?:-q\d{1,3})?|scaled)$", "", stem, flags=re.I)
     stem = re.sub(r"[_-](?:600|804|1026|1080x?|1281|1536|1800x?|1920|2000x?)$", "", stem, flags=re.I)
     return f"{parsed.netloc}{dirname}/{stem}".lower()
+
+
+def normalize_wix_media_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "static.wixstatic.com" or "/media/" not in parsed.path:
+        return url
+
+    media_id = parsed.path.split("/media/", 1)[1].split("/", 1)[0]
+    if not media_id or not re.search(r"\.(jpe?g|png|webp|avif)$", media_id, re.I):
+        return url
+
+    return urlunparse((parsed.scheme, parsed.netloc, f"/media/{media_id}", "", "", ""))
+
+
+def shopify_image_identity_key(parsed: Any) -> str:
+    hostname = (parsed.hostname or "").lower()
+    path = unquote(parsed.path).lower()
+    match = re.search(r"/cdn/shop/(files|products|collections)/(.+)$", path)
+    if not match and hostname == "cdn.shopify.com":
+        match = re.search(r"/s/files/\d+/\d+/\d+/\d+/(files|products|collections)/(.+)$", path)
+    if not match:
+        return ""
+    folder, filename = match.groups()
+    filename = filename.rsplit("/", 1)[-1]
+    stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
+    stem = re.sub(r"[_-](?:\d{2,5}x\d{2,5}|\d{2,5}x(?:-q\d{1,3})?|scaled)$", "", stem, flags=re.I)
+    stem = re.sub(r"[_-](?:600|804|1026|1080x?|1281|1536|1800x?|1920|2000x?)$", "", stem, flags=re.I)
+    return f"shopify:{folder}/{stem}"
 
 
 def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
@@ -209,10 +293,80 @@ def normalized_hostname(url: str) -> str:
     return hostname[4:] if hostname.startswith("www.") else hostname
 
 
+def resolve_hash_project_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = normalized_hostname(url)
+    if hostname not in HASH_PROJECT_ROUTE_DOMAINS or not parsed.fragment.startswith("/"):
+        return url
+    fragment_path = parsed.fragment.split("?", 1)[0].strip()
+    if not fragment_path or fragment_path == "/":
+        return url
+    if not fragment_path.endswith("/"):
+        fragment_path += "/"
+    return urlunparse((parsed.scheme, parsed.netloc, fragment_path, "", "", ""))
+
+
 def filter_domain_image_candidates(candidates: list[ImageCandidate], page_url: str) -> list[ImageCandidate]:
-    if normalized_hostname(page_url) in SECOND_IMAGE_FILTER_DOMAINS and len(candidates) >= 2:
+    hostname = normalized_hostname(page_url)
+    if hostname in PRIMARY_GALLERY_ONLY_DOMAINS:
+        candidates = prefer_primary_product_gallery(candidates)
+    if hostname in EARLY_GALLERY_FILTER_DOMAINS:
+        candidates = filter_early_contiguous_gallery(candidates)
+    if hostname in SECOND_IMAGE_FILTER_DOMAINS and len(candidates) >= 2:
         return candidates[:1] + candidates[2:]
     return candidates
+
+
+def filter_early_contiguous_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    ordered = sorted(
+        [
+            item
+            for item in candidates
+            if item.order < 100_000
+            and item.score >= 20
+            and re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", urlparse(item.url).path, re.I)
+        ],
+        key=lambda item: item.order,
+    )
+    if len(ordered) < 4:
+        return candidates
+
+    runs: list[list[ImageCandidate]] = []
+    current = [ordered[0]]
+    for item in ordered[1:]:
+        if item.order - current[-1].order <= 2:
+            current.append(item)
+        else:
+            runs.append(current)
+            current = [item]
+    runs.append(current)
+
+    first_gallery = next((run for run in runs if len(run) >= 3), None)
+    if not first_gallery:
+        return candidates
+    return sorted(first_gallery, key=lambda item: item.order)
+
+
+def prefer_primary_product_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    gallery = [
+        item
+        for item in candidates
+        if "inside primary product gallery" in item.reasons
+    ]
+    if len(gallery) < 2:
+        return candidates
+    return sorted(gallery, key=lambda item: (item.order, -item.score))
+
+
+def prefer_authoritative_image_list(candidates: list[ImageCandidate], image_urls: list[str]) -> list[ImageCandidate]:
+    keys = list(dict.fromkeys(image_identity_key(url) for url in image_urls if image_identity_key(url)))
+    if len(keys) < 2:
+        return candidates
+    key_order = {key: index for index, key in enumerate(keys)}
+    matched = [item for item in candidates if image_identity_key(item.url) in key_order]
+    if len(matched) < 2:
+        return candidates
+    return sorted(matched, key=lambda item: (key_order[image_identity_key(item.url)], -item.score, item.order))
 
 
 def prefer_page_path_images(candidates: list[ImageCandidate], page_url: str) -> list[ImageCandidate]:
@@ -256,7 +410,11 @@ def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandi
             continue
         if gallery:
             break
-    return gallery if len(gallery) >= 3 else candidates
+    if len(gallery) >= 3:
+        for item in gallery:
+            item.add(30, "numbered gallery sequence")
+        return gallery
+    return candidates
 
 
 def prefer_leading_filename_series(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
@@ -283,6 +441,15 @@ def prefer_leading_filename_series(candidates: list[ImageCandidate]) -> list[Ima
 
 
 def prefer_early_product_gallery(candidates: list[ImageCandidate]) -> list[ImageCandidate]:
+    numbered = []
+    for item in candidates:
+        match = re.match(r"^view\s+(\d+)$", item.alt.strip(), re.I)
+        if not match:
+            break
+        numbered.append(int(match.group(1)))
+    if len(numbered) >= 3 and numbered == list(range(1, len(numbered) + 1)):
+        return candidates
+
     useful = [
         item
         for item in candidates
@@ -327,6 +494,17 @@ def url_for_series(url: str) -> str:
     return url
 
 
+def strip_trailing_image_sequence_suffix(stem: str) -> str:
+    while True:
+        match = re.match(r"^(.+?)-(\d{1,4})$", stem)
+        if not match:
+            return stem
+        suffix = int(match.group(2))
+        if 1800 <= suffix <= 2099:
+            return stem
+        stem = match.group(1)
+
+
 def image_series_key(item: ImageCandidate) -> str:
     parsed = urlparse(url_for_series(item.url))
     path = parsed.path
@@ -351,11 +529,7 @@ def image_series_key(item: ImageCandidate) -> str:
     match = re.match(r"^(.+?)-\d{1,4}-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$", stem, re.I)
     if match:
         stem = match.group(1)
-    match = re.match(r"^(.+?)-(\d{1,4})$", stem)
-    if match:
-        suffix = int(match.group(2))
-        if not (1800 <= suffix <= 2099):
-            stem = match.group(1)
+    stem = strip_trailing_image_sequence_suffix(stem)
     match = re.match(r"^(.+?)[_-][a-z]$", stem)
     if match:
         stem = match.group(1)
@@ -479,6 +653,7 @@ def normalize_url(raw: str, base_url: str) -> str:
         raw = "https:" + raw
     url = urljoin(base_url, raw)
     url = url_for_series(url)
+    url = normalize_wix_media_url(url)
     return compact_url(url)
 
 
@@ -504,6 +679,62 @@ def pick_srcset_best(srcset: str) -> str:
             best_url = url
             best_score = score
     return best_url
+
+
+def pick_srcset_width(srcset: str, preferred_width: int) -> str:
+    best_url = ""
+    best_distance: int | None = None
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if len(bits) < 2:
+            continue
+        token = bits[1].lower()
+        if not token.endswith("w") or not token[:-1].isdigit():
+            continue
+        width = int(token[:-1])
+        distance = abs(width - preferred_width)
+        if best_distance is None or distance < best_distance or (
+            distance == best_distance and width == preferred_width
+        ):
+            best_url = bits[0]
+            best_distance = distance
+    return best_url
+
+
+def image_url_from_img_tag(img: Any, base_url: str, preferred_srcset_width: int | None = None) -> str:
+    raw_url = ""
+    if preferred_srcset_width is not None and img.get("srcset"):
+        raw_url = pick_srcset_width(str(img["srcset"]), preferred_srcset_width)
+    if not raw_url:
+        raw_url = clean_text(img.get("src") or img.get("data-src") or "")
+    return normalize_url(raw_url, base_url)
+
+
+def extract_atkris_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+
+    featured = soup.select_one(".featured-image img")
+    if featured is not None:
+        featured_url = image_url_from_img_tag(featured, base_url, preferred_srcset_width=1600)
+        if featured_url:
+            urls.append(featured_url)
+
+    gallery_images = soup.select(".product-slider-thumbs .slider img")
+    if not gallery_images:
+        gallery_images = soup.select(".product-slider-thumbs .slider-nav img")
+    for img in gallery_images:
+        gallery_url = image_url_from_img_tag(img, base_url)
+        if gallery_url:
+            urls.append(gallery_url)
+
+    return list(dict.fromkeys(urls))
+
+
+def extract_domain_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    hostname = normalized_hostname(base_url)
+    if hostname in ATKRIS_PRODUCT_IMAGE_DOMAINS:
+        return extract_atkris_product_image_urls(soup, base_url)
+    return []
 
 
 def flatten_jsonld(node: Any) -> list[dict[str, Any]]:
@@ -534,6 +765,22 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def extract_offer_price(offer: dict[str, Any]) -> tuple[str, str]:
+    price = clean_price_text(offer.get("price"))
+    currency = clean_text(offer.get("priceCurrency")).upper()
+    if price and currency:
+        return price, currency
+
+    for spec in as_list(offer.get("priceSpecification")):
+        if not isinstance(spec, dict):
+            continue
+        spec_price = clean_price_text(spec.get("price"))
+        spec_currency = clean_text(spec.get("priceCurrency")).upper()
+        if spec_price:
+            return spec_price, spec_currency or currency
+    return price, currency
+
+
 def extract_image_urls(value: Any, base_url: str) -> list[str]:
     urls: list[str] = []
     for item in as_list(value):
@@ -556,6 +803,14 @@ def merge_product_info(primary: dict[str, Any], secondary: dict[str, Any]) -> di
             combined.update(merged[key])
             merged[key] = combined
             continue
+        if key == "price":
+            existing = merged.get(key)
+            if not existing or (not price_is_valid(existing) and price_is_valid(value)):
+                merged[key] = value
+            continue
+        if key == "currency" and not merged.get(key):
+            merged[key] = value
+            continue
         if not merged.get(key):
             merged[key] = value
     return merged
@@ -569,7 +824,7 @@ def clean_product_title(title: str) -> str:
     suffix_noise = re.compile(
         r"(gallery|galleria|galerie|shop|store|collectibles|design|mobilia|"
         r"mdrn|modern living|atkris|objekt|béton brut|beton brut|daddy deco|"
-        r"paulette|approved|spazio leone|the oblist|envan rijn)",
+        r"paulette|approved|spazio leone|the oblist|envan rijn|ancien et jolie|sauce)",
         re.I,
     )
     for separator in separators:
@@ -577,7 +832,8 @@ def clean_product_title(title: str) -> str:
         if len(parts) >= 2 and suffix_noise.search(parts[-1]):
             title = clean_text(separator.join(parts[:-1]))
             break
-    title = re.sub(r"\s+[£$€]\s?[\d,.]+(?:\s*[A-Z]{3})?$", "", title).strip()
+    title = re.sub(r"\s+[£$€]\s?[\d,.]+(?:\s*[A-Z]{3})?(?:\s*\|\s*Item\s*\(\d+\))?$", "", title, flags=re.I).strip()
+    title = re.sub(r"\s*\|\s*Item\s*\(\d+\)\s*$", "", title, flags=re.I).strip()
     return title
 
 
@@ -635,9 +891,27 @@ def details_from_property_values(value: Any) -> dict[str, Any]:
     return details
 
 
+def extract_labeled_detail_pairs(text: str, labels: list[str]) -> dict[str, str]:
+    normalized_text = clean_text(text)
+    if not normalized_text:
+        return {}
+    label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    pattern = re.compile(rf"(?P<label>{label_pattern})\s*[:：]\s*", re.I)
+    matches = list(pattern.finditer(normalized_text))
+    details: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        value_start = match.end()
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized_text)
+        label = clean_detail_key(match.group("label"))
+        value = clean_detail_value(normalized_text[value_start:value_end])
+        if label and isinstance(value, str) and value:
+            details[normalize_detail_label(label)] = value.strip(" .;-")
+    return details
+
+
 def is_weak_existing_name(name: str) -> bool:
     normalized = clean_text(name).lower()
-    if normalized in {"", "shop", "store", "home", "monument", "spazio leone"}:
+    if normalized in {"", "shop", "store", "home", "monument", "spazio leone", "objekt"}:
         return True
     return bool(
         re.search(
@@ -673,13 +947,14 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                     "ratingValue": rating.get("ratingValue"),
                     "reviewCount": rating.get("reviewCount") or rating.get("ratingCount"),
                 }
+            price, currency = extract_offer_price(offer0)
             current = {
                 "name": clean_product_title(clean_text(item.get("name"))),
                 "description": clean_text(item.get("description")),
                 "sku": clean_text(item.get("sku") or item.get("mpn")),
                 "brand": clean_text(brand),
-                "price": clean_price_text(offer0.get("price")),
-                "currency": clean_text(offer0.get("priceCurrency")),
+                "price": price,
+                "currency": currency,
                 "availability": clean_text(offer0.get("availability")),
                 "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
                 "rating": rating,
@@ -712,6 +987,26 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
 def normalize_detail_label(label: str) -> str:
     normalized = clean_text(label).strip(":").strip()
     lower = normalized.lower()
+    canonical_labels = {
+        "place of origin": "Place of Origin",
+        "country of origin": "Place of Origin",
+        "country of manufacture": "Place of Origin",
+        "land van herkomst": "Place of Origin",
+        "origin country": "Place of Origin",
+        "production country": "Place of Origin",
+        "made in": "Place of Origin",
+        "date of manufacture": "Date of Manufacture",
+        "year of manufacture": "Date of Manufacture",
+        "materials and techniques": "Materials and Techniques",
+        "designed by": "Designer",
+        "produced by": "Manufacturer",
+        "producer": "Manufacturer",
+        "maker": "Manufacturer",
+        "reference number": "Reference Number",
+        "ref": "Reference Number",
+    }
+    if lower in canonical_labels:
+        return canonical_labels[lower]
     if lower in {
         "dimensions",
         "dimension",
@@ -924,8 +1219,146 @@ def line_looks_like_price(line: str) -> bool:
         return True
     if re.match(r"^[£$€]\s?[\d,.]+(?:\s*(?:No VAT|incl\.?\s*VAT|excl\.?\s*VAT|EUR|USD|GBP|SEK))?$", line, re.I):
         return True
+    if re.match(r"^\d[\d\s,.]*\s*(?:EUR|USD|GBP|SEK)(?:\s*(?:No VAT|incl\.?\s*VAT|excl\.?\s*VAT))?$", line, re.I):
+        return True
     code_match = re.match(r"^([A-Z]{3})\s?[\d,.]+(?:\s*(?:incl\.?\s*VAT|excl\.?\s*VAT|No VAT))?$", line)
     return bool(code_match and code_match.group(1) in KNOWN_CURRENCY_CODES)
+
+
+def line_looks_like_labeled_price_value(line: str) -> bool:
+    line = clean_price_text(line)
+    if not line or len(line) > 40:
+        return False
+    if re.search(r"[A-Za-zÀ-ÿ]{3,}", line) and not re.search(r"\b(?:EUR|USD|GBP|SEK|VAT)\b", line, re.I):
+        return False
+    amount = price_amount(line)
+    return amount is not None and amount > 0
+
+
+def find_dom_price(lines: list[str], nav_words: set[str]) -> tuple[int | None, str]:
+    currency_tokens = {"€", "$", "£", "EUR", "USD", "GBP"}
+    amount_re = re.compile(r"^\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?$|^\d+(?:[.,]\d{2})?$|^\d[\d\s.,]*[,.-]\s*-$")
+    for index, line in enumerate(lines):
+        upper = line.upper()
+        if upper.startswith(("RELATED PRODUCTS", "RECOMMENDED PRODUCTS")):
+            break
+        if re.match(r"^Price\s*:?\s*$", line, re.I):
+            currency = ""
+            for offset, value in enumerate(lines[index + 1 : index + 6], start=1):
+                if value.upper() in nav_words:
+                    continue
+                if value in currency_tokens or value.upper() in currency_tokens:
+                    currency = value
+                    continue
+                if amount_re.match(value):
+                    return index + offset, clean_price_text(f"{currency} {value}".strip())
+                candidate = clean_price_text(f"{currency} {value}".strip())
+                if line_looks_like_labeled_price_value(candidate):
+                    return index + offset, candidate
+                if line_looks_like_price(value):
+                    return index + offset, clean_price_text(value)
+            continue
+        if line in currency_tokens or upper in currency_tokens:
+            for offset, value in enumerate(lines[index + 1 : index + 4], start=1):
+                nearby = " ".join(lines[max(0, index - 5) : index + offset + 1])
+                if re.search(
+                    r"(currency|valuta|shipment costs|shipping|delivery time|transport prices|european union|united kingdom|united states|china)",
+                    nearby,
+                    re.I,
+                ):
+                    break
+                candidate = clean_price_text(f"{line} {value}".strip())
+                if line_looks_like_labeled_price_value(candidate):
+                    return index + offset, candidate
+        nearby = " ".join(lines[max(0, index - 5) : index + 1])
+        if "RELATED PRODUCTS" in nearby.upper() or "RECOMMENDED PRODUCTS" in nearby.upper():
+            break
+        if line_looks_like_price(line) and not re.search(
+            r"(shipment costs|shipping|delivery time|transport prices|european union|united kingdom|united states|china)",
+            nearby,
+            re.I,
+        ):
+            return index, clean_price_text(line)
+    return None, ""
+
+
+def extract_labeled_description(lines: list[str], nav_words: set[str], labels: list[str]) -> str:
+    stop_markers = {
+        "CONDITION REPORT",
+        "SPECIFICATIONS",
+        "REQUEST INFO",
+        "REQUEST INFO ABOUT THIS PRODUCT",
+        "RELATED PRODUCTS",
+        "RECOMMENDED PRODUCTS",
+    }
+    label_markers = {label.upper() for label in labels}
+    for index, line in enumerate(lines):
+        if not re.match(r"^Description\s*:?\s*$", line, re.I):
+            continue
+        description_lines: list[str] = []
+        for value in lines[index + 1 :]:
+            upper = value.upper()
+            if upper in nav_words or upper in stop_markers or upper in label_markers:
+                break
+            if re.match(r"^(Condition Report|Specifications|Request Info|Related Products|Recommended Products)\b", value, re.I):
+                break
+            description_lines.append(value)
+        return clean_text(" ".join(description_lines))
+    return ""
+
+
+def extract_heading_lead_description(
+    lines: list[str],
+    product_name: str,
+    nav_words: set[str],
+    labels: list[str],
+    price_labels: list[str],
+) -> str:
+    wanted = normalize_match_text(product_name)
+    if not wanted:
+        return ""
+
+    heading_index = None
+    wanted_tokens = {token for token in wanted.split() if len(token) >= 4}
+    for index, line in enumerate(lines):
+        candidate = normalize_match_text(line)
+        if not candidate:
+            continue
+        candidate_tokens = {token for token in candidate.split() if len(token) >= 4}
+        overlap = candidate_tokens & wanted_tokens
+        is_heading_match = (
+            candidate == wanted
+            or (len(candidate) >= 20 and (candidate in wanted or wanted in candidate))
+            or (
+                len(candidate_tokens) >= 3
+                and len(overlap) >= min(5, len(wanted_tokens))
+                and len(overlap) / len(candidate_tokens) >= 0.6
+            )
+        )
+        if is_heading_match:
+            heading_index = index
+            break
+    if heading_index is None:
+        return ""
+
+    label_markers = tuple(label.upper() for label in labels + price_labels)
+    description_lines: list[str] = []
+    for line in lines[heading_index + 1 :]:
+        upper = line.upper()
+        if upper in nav_words:
+            break
+        if upper.startswith(label_markers):
+            break
+        if line_looks_like_price(line) or line_looks_like_dimensions(line):
+            break
+        if re.match(r"^(ENQUIRE|SOLD|ADD TO CART|BUY NOW|PREVIOUS|NEXT)$", line, re.I):
+            break
+        if len(line) < 20 and description_lines:
+            break
+        if len(line) >= 20:
+            description_lines.append(line)
+
+    return clean_text(" ".join(description_lines))
 
 
 def extract_heading_text_block(
@@ -1045,16 +1478,7 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         "T&CS",
     }
 
-    price_index = None
-    for index, line in enumerate(lines):
-        nearby = " ".join(lines[max(0, index - 5) : index + 5])
-        if line_looks_like_price(line) and not re.search(
-            r"(shipment costs|shipping|delivery time|transport prices|european union|united kingdom|united states|china)",
-            nearby,
-            re.I,
-        ):
-            price_index = index
-            break
+    price_index, price = find_dom_price(lines, nav_words)
 
     name = ""
     for heading in soup.find_all(["h1", "h2", "h3"]):
@@ -1093,15 +1517,48 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
             name = clean_text(h1.get_text(" "))
     name = clean_product_title(name)
     title_name = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    if existing_name and not is_weak_existing_name(existing_name) and is_weak_existing_name(name):
+        name = clean_product_title(existing_name)
     if title_name and is_weak_existing_name(name):
         name = title_name
 
-    price = clean_price_text(lines[price_index]) if price_index is not None else ""
     labels = [
         "Designer",
+        "Design",
+        "Designed by",
         "Manufacturer",
+        "Maker",
+        "Produced by",
+        "Producer",
+        "Creator",
+        "Place of Origin",
+        "Place Of Origin",
+        "Country of Origin",
+        "Country Of Origin",
+        "Country of Manufacture",
+        "Country Of Manufacture",
+        "Land van herkomst",
+        "Origin Country",
+        "Production Country",
+        "Made in",
+        "Made In",
+        "Origin",
+        "Country",
+        "Date of Manufacture",
+        "Date Of Manufacture",
+        "Year of Manufacture",
+        "Year Of Manufacture",
+        "Year",
         "Material",
+        "Materials",
+        "Materials and Techniques",
+        "Materials And Techniques",
         "Period",
+        "Era",
+        "Circa",
+        "Reference Number",
+        "Reference",
+        "Ref",
         "Dimensions",
         "Dimension",
         "Measurements",
@@ -1111,7 +1568,24 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         "Height",
         "Width",
         "Depth",
+        "Length",
+        "Seat Height",
         "Condition",
+    ]
+    price_labels = [
+        "Price",
+        "Prix",
+        "Preis",
+        "Precio",
+        "Prezzo",
+        "Regular Price",
+        "Sale Price",
+        "Public Price",
+        "Trade Price",
+        "Asking Price",
+        "Retail Price",
+        "List Price",
+        "Listed Price",
     ]
     details: dict[str, Any] = {}
 
@@ -1152,9 +1626,16 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                 add_detail(term.get_text(" "), " ".join(values))
 
     for line in lines:
+        if re.match(
+            r"^[A-Z][A-Za-zÀ-ÿ-]+(?:\s+[A-Z][A-Za-zÀ-ÿ-]+){0,2},\s*(?:\d{4}s?|(?:\d{1,2}(?:st|nd|rd|th)\s+century))\b",
+            line,
+        ):
+            add_detail("Origin / period", line)
         match = re.match(r"^([^:：]{2,80})\s*[:：]\s*(.{1,1000})$", line)
         if match:
             add_detail(match.group(1), match.group(2))
+        for detail_key, detail_value in extract_labeled_detail_pairs(line, labels).items():
+            add_detail(detail_key, detail_value)
 
     for label in labels:
         same_line_pattern = re.compile(rf"^{re.escape(label)}\s*:\s*(.+)$", re.I)
@@ -1176,6 +1657,31 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                     add_detail(detail_key, value)
                     break
 
+    for label in price_labels:
+        same_line_pattern = re.compile(rf"^{re.escape(label)}\s*[:：]\s*(.+)$", re.I)
+        label_only_pattern = re.compile(rf"^{re.escape(label)}\s*[:：]?\s*$", re.I)
+        for index, line in enumerate(lines):
+            if price:
+                break
+            match = same_line_pattern.match(line)
+            if match and line_looks_like_price(match.group(1)):
+                price_index = index
+                price = clean_price_text(match.group(1))
+                break
+            if label_only_pattern.match(line):
+                currency = ""
+                for offset, value in enumerate(lines[index + 1 : index + 6], start=1):
+                    if value.upper() in nav_words:
+                        continue
+                    if value in {"€", "$", "£"} or value.upper() in KNOWN_CURRENCY_CODES:
+                        currency = value
+                        continue
+                    candidate = clean_price_text(f"{currency} {value}".strip())
+                    if line_looks_like_price(candidate) or line_looks_like_labeled_price_value(candidate):
+                        price_index = index + offset
+                        price = candidate
+                        break
+
     dimensions_from_lines = extract_dimensions_from_lines(lines)
     existing_dimensions = str(details.get("dimensions") or "")
     if dimensions_from_lines and (
@@ -1185,13 +1691,16 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
 
     heading_info = extract_heading_text_block(soup, name, nav_words)
 
-    description = ""
+    description = extract_labeled_description(lines, nav_words, labels)
+    if not description:
+        description = extract_heading_lead_description(lines, name, nav_words, labels, price_labels)
     if price_index is not None:
         start = price_index + 1
         while start < len(lines) and (
-            lines[start].upper() in {"ENQUIRE", "SOLD", "ADD TO CART"}
+            lines[start].upper() in {"ENQUIRE", "SOLD", "ADD TO CART", "CONTACT US", "REQUEST INFO"}
             or lines[start].lower() == name.lower()
             or lines[start] == price
+            or lines[start] == "0"
         ):
             start += 1
         if start < len(lines):
@@ -1207,12 +1716,22 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                 if not lines[start]:
                     start += 1
         stop = len(lines)
-        for marker in labels + ["RECOMMENDED PRODUCTS", "RELATED PRODUCTS"]:
+        for marker in labels + [
+            "RECOMMENDED PRODUCTS",
+            "RELATED PRODUCTS",
+            "PREVIOUS",
+            "NEXT",
+            "FACEBOOK",
+            "INSTAGRAM",
+            "CONTACT US",
+            "OBJEKT B.V.",
+        ]:
             for index in range(start, len(lines)):
                 if lines[index].upper().startswith(marker.upper()):
                     stop = min(stop, index)
                     break
-        description = clean_text(" ".join(lines[start:stop]))
+        if not description:
+            description = clean_text(" ".join(lines[start:stop]))
 
     info: dict[str, Any] = {"source": "dom-text", "url": base_url}
     if name and is_weak_existing_name(existing_name):
@@ -1233,6 +1752,52 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         info["dimensions"] = str(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
+
+
+def parse_shopify_product_payload(
+    product: dict[str, Any],
+    base_url: str,
+    source: str,
+) -> tuple[dict[str, Any], list[str]]:
+    variants = product.get("variants") or []
+    first_variant = variants[0] if variants else {}
+    images = []
+    for image in product.get("images") or []:
+        if isinstance(image, str):
+            images.append(normalize_url(image, base_url))
+        elif isinstance(image, dict):
+            images.append(normalize_url(image.get("src") or image.get("url") or "", base_url))
+    for media in product.get("media") or []:
+        if not isinstance(media, dict):
+            continue
+        media_url = media.get("src")
+        preview = media.get("preview_image")
+        if not media_url and isinstance(preview, dict):
+            media_url = preview.get("src")
+        if media_url:
+            images.append(normalize_url(str(media_url), base_url))
+
+    handle = clean_text(product.get("handle"))
+    product_url = clean_text(product.get("url"))
+    if not product_url and handle:
+        product_url = f"/products/{handle}"
+    info = {
+        "name": clean_text(product.get("title")),
+        "description": clean_text(BeautifulSoup(product.get("description") or "", "lxml").get_text(" ")),
+        "sku": clean_text(first_variant.get("sku")),
+        "price": format_shopify_price(product.get("price") or first_variant.get("price")),
+        "currency": clean_text(product.get("currency") or first_variant.get("currency")).upper(),
+        "url": normalize_url(product_url, base_url) if product_url else "",
+        "source": source,
+    }
+    details = details_from_mapping(
+        product,
+        {"title", "description", "body_html", "image", "images", "featured_image"},
+    )
+    if details:
+        info["details"] = details
+    add_synthesized_dimensions(info)
+    return info, list(dict.fromkeys(u for u in images if u))
 
 
 def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any], list[str]]:
@@ -1263,31 +1828,74 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
     except Exception:
         return {}, []
 
-    variants = product.get("variants") or []
-    first_variant = variants[0] if variants else {}
-    images = []
-    for image in product.get("images") or []:
-        if isinstance(image, str):
-            images.append(normalize_url(image, endpoint))
-        elif isinstance(image, dict):
-            images.append(normalize_url(image.get("src") or image.get("url") or "", endpoint))
-    info = {
-        "name": clean_text(product.get("title")),
-        "description": clean_text(BeautifulSoup(product.get("description") or "", "lxml").get_text(" ")),
-        "sku": clean_text(first_variant.get("sku")),
-        "price": format_shopify_price(product.get("price") or first_variant.get("price")),
-        "currency": clean_text(product.get("currency") or first_variant.get("currency")).upper(),
-        "url": endpoint.removesuffix(".js"),
-        "source": "shopify-product-json",
-    }
-    details = details_from_mapping(
-        product,
-        {"title", "description", "body_html", "image", "images", "featured_image"},
-    )
-    if details:
-        info["details"] = details
-    add_synthesized_dimensions(info)
-    return info, [u for u in images if u]
+    info, images = parse_shopify_product_payload(product, endpoint, "shopify-product-json")
+    if not info.get("url"):
+        info["url"] = endpoint.removesuffix(".js")
+    return info, images
+
+
+def extract_inline_shopify_product_json(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
+    parsed = urlparse(base_url)
+    handle_match = re.search(r"/products/([^/?#]+)", parsed.path)
+    page_handle = handle_match.group(1).lower() if handle_match else ""
+    for script in soup.find_all("script"):
+        script_id = clean_text(script.get("id"))
+        script_type = clean_text(script.get("type"))
+        raw = script.string or script.get_text()
+        if not raw or '"images"' not in raw or '"variants"' not in raw:
+            continue
+        if script_type and not re.search(r"(json|javascript)", script_type, re.I):
+            continue
+        if script_id and not re.search(r"(product|shopify)", script_id, re.I):
+            continue
+        try:
+            product = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(product, dict):
+            continue
+        handle = clean_text(product.get("handle")).lower()
+        if page_handle and handle and handle != page_handle:
+            continue
+        info, images = parse_shopify_product_payload(product, base_url, "inline-shopify-product-json")
+        if images:
+            return info, images
+    return {}, []
+
+
+def extract_analytics_product_info(soup: BeautifulSoup) -> dict[str, Any]:
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text()
+        if not raw or "view_item" not in raw or "price" not in raw:
+            continue
+        marker = re.search(r"gtag\(\s*['\"]event['\"]\s*,\s*['\"]view_item['\"]\s*,", raw)
+        if not marker:
+            continue
+        object_start = raw.find("{", marker.end())
+        if object_start < 0:
+            continue
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(raw[object_start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        candidates = []
+        items = payload.get("items")
+        if isinstance(items, list):
+            candidates.extend(item for item in items if isinstance(item, dict))
+        candidates.append(payload)
+        for item in candidates:
+            price = clean_price_text(item.get("price"))
+            currency = clean_text(item.get("currency") or payload.get("currency")).upper()
+            if price_is_valid(price) and currency in KNOWN_CURRENCY_CODES:
+                return {
+                    "price": price,
+                    "currency": currency,
+                    "source": "analytics-view-item",
+                }
+    return {}
 
 
 def try_monument_airtable_api(
@@ -1463,12 +2071,18 @@ def infer_context_score(element: Any) -> tuple[int, list[str]]:
         attrs = " ".join(
             clean_text(cursor.get(attr, "")) for attr in ("class", "id", "role", "aria-label")
         )
-        if re.search(r"(product|pdp|gallery|carousel|media|image|photo|slider|zoom)", attrs, re.I):
+        if re.search(r"\bproduct-gallery\b|gallery-lightbox", attrs, re.I):
+            score += max(28, 70 - depth * 8)
+            reasons.append("inside primary product gallery")
+        elif re.search(r"\bproduct-list\b|product-list-item|grid-item", attrs, re.I):
+            score -= max(24, 64 - depth * 8)
+            reasons.append("inside product listing block")
+        elif re.search(r"(header|footer|nav|menu|newsletter|social|recommend|related)", attrs, re.I):
+            score -= max(30, 60 - depth * 6)
+            reasons.append("inside likely non-product block")
+        elif re.search(r"(product|pdp|gallery|carousel|media|image|photo|slider|zoom)", attrs, re.I):
             score += 18 - depth * 2
             reasons.append("inside product/media block")
-        if re.search(r"(header|footer|nav|menu|newsletter|social|recommend|related)", attrs, re.I):
-            score -= 20
-            reasons.append("inside likely non-product block")
         cursor = cursor.parent
     return score, reasons
 
@@ -1570,6 +2184,8 @@ def gather_image_candidates(
                 item.add(20, "large declared dimensions")
         if re.search(r"\.(svg|gif)(\?|$)", path, re.I):
             item.add(-80, "low-value image format")
+        if re.search(r"(?:^|\.)icons8\.com$", urlparse(item.url).hostname or "", re.I):
+            item.add(-120, "third-party icon asset")
     ranked = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
     return ranked
 
@@ -1593,7 +2209,28 @@ def fetch_static(url: str) -> tuple[str, str]:
             "Referer": f"{parsed.scheme}://{parsed.netloc}/",
         }
     )
-    response = session.get(url, timeout=30)
+    try:
+        response = session.get(url, timeout=30)
+    except requests.exceptions.SSLError:
+        if parsed.hostname and parsed.hostname.startswith("www."):
+            retry_url = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc.removeprefix("www."),
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+            logger.warning(
+                "extractor stage=fetch_static_retry_bare_domain host=%s retry_url=%s",
+                parsed.netloc,
+                retry_url,
+            )
+            response = session.get(retry_url, timeout=30)
+        else:
+            raise
     logger.info(
         "extractor stage=fetch_static_response host=%s status=%d elapsed=%.2fs",
         parsed.netloc,
@@ -1656,7 +2293,11 @@ def fetch_rendered(url: str) -> tuple[str, str]:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
-                page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1440, "height": 1600})
+                page = browser.new_page(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1440, "height": 1600},
+                    ignore_https_errors=True,
+                )
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=12000)
@@ -1700,16 +2341,16 @@ def download_images(images: list[dict[str, Any]], out_dir: Path, session: reques
             item["download_error"] = str(exc)
 
 
-def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str, Any]:
+def extract(url: str, render: bool, max_images: int) -> dict[str, Any]:
     started = time.monotonic()
     max_images = max(1, min(max_images, MAX_PRODUCT_IMAGES))
+    url = resolve_hash_project_url(url)
     parsed = urlparse(url)
     logger.info(
-        "extractor event=started host=%s render=%s max_images=%d min_score=%d",
+        "extractor event=started host=%s render=%s max_images=%d",
         parsed.netloc,
         render,
         max_images,
-        min_score,
     )
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
@@ -1734,20 +2375,31 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)
     shopify_info, shopify_images = try_shopify_json(final_url, session)
+    inline_shopify_info, inline_shopify_images = extract_inline_shopify_product_json(soup, final_url)
+    analytics_info = extract_analytics_product_info(soup)
     nextjs_info = extract_nextjs_product_info(soup)
     auctionet_info = extract_auctionet_page_data(soup)
+    domain_product_images = extract_domain_product_image_urls(soup, final_url)
 
     product_info = {}
-    for info in (jsonld_info, shopify_info, meta_info):
+    for info in (jsonld_info, shopify_info, inline_shopify_info, meta_info):
         product_info = merge_product_info(product_info, info)
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
     product_info = merge_product_info(dom_info, product_info)
+    product_info = merge_product_info(analytics_info, product_info)
     product_info = merge_product_info(nextjs_info, product_info)
     product_info = merge_product_info(auctionet_info, product_info)
     add_synthesized_dimensions(product_info)
     product_info["page_url"] = final_url
 
-    structured_images = list(dict.fromkeys(jsonld_images + shopify_images))
+    authoritative_images = domain_product_images or shopify_images or inline_shopify_images or jsonld_images
+    authoritative_keys = {
+        key
+        for key in (image_identity_key(url) for url in authoritative_images)
+        if key
+    }
+    has_authoritative_gallery = len(authoritative_keys) >= 3
+    structured_images = list(dict.fromkeys(domain_product_images + jsonld_images + shopify_images + inline_shopify_images))
     candidates = gather_image_candidates(
         soup,
         final_url,
@@ -1756,12 +2408,14 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
         product_info.get("name", ""),
     )
     candidates = dedupe_image_candidates(candidates)
-    candidates = prefer_numbered_gallery(candidates)
-    candidates = prefer_leading_filename_series(candidates)
-    candidates = prefer_early_product_gallery(candidates)
-    candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
-    candidates = prefer_page_path_images(candidates, final_url)
-    candidates = filter_domain_image_candidates(candidates, final_url)
+    candidates = prefer_authoritative_image_list(candidates, authoritative_images)
+    if not has_authoritative_gallery:
+        candidates = prefer_numbered_gallery(candidates)
+        candidates = prefer_leading_filename_series(candidates)
+        candidates = prefer_early_product_gallery(candidates)
+        candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
+        candidates = prefer_page_path_images(candidates, final_url)
+        candidates = filter_domain_image_candidates(candidates, final_url)
     selected = [
         {
             "url": c.url,
@@ -1773,7 +2427,6 @@ def extract(url: str, render: bool, max_images: int, min_score: int) -> dict[str
             "reasons": c.reasons,
         }
         for c in candidates
-        if c.score >= min_score
     ][:max_images]
 
     logger.info(
@@ -1805,7 +2458,6 @@ def main() -> int:
     parser.add_argument("--render", action="store_true", help="Render JavaScript with Playwright")
     parser.add_argument("--download-images", action="store_true", help="Download selected images")
     parser.add_argument("--max-images", type=int, default=12, help="Maximum selected images")
-    parser.add_argument("--min-score", type=int, default=25, help="Minimum image confidence score")
     parser.add_argument(
         "--out",
         default="product_extract",
@@ -1814,7 +2466,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        result = extract(args.url, args.render, args.max_images, args.min_score)
+        result = extract(args.url, args.render, args.max_images)
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
         if args.download_images:

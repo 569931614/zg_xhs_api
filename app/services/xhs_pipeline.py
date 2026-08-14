@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -24,12 +24,16 @@ TARGET_RATIO = 3.0 / 4.0
 DUOMI_CREATE_URL = "https://duomiapi.com/v1/images/generations?async=true"
 DUOMI_TASK_URL_TEMPLATE = "https://duomiapi.com/v1/tasks/{task_id}"
 ARK_IMAGE_GENERATION_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+ARK_RESPONSES_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
 DEFAULT_ARK_IMAGE_MODEL = "doubao-seedream-5-0-260128"
 DEFAULT_ARK_IMAGE_SIZE = "1728x2304"
+DEFAULT_ARK_REFERENCE_MAX_PIXELS = 36_000_000
+DEFAULT_XHS_COPY_MODEL = "deepseek-v4-flash-260425"
 DEFAULT_XHS_POST_API_BASE = "https://xhspost.aivip1.top"
 DEFAULT_XHS_POST_API_KEY = "xhs_post"
 TERMINAL_SUCCESS = {"succeeded", "success", "completed", "complete"}
 TERMINAL_FAILURE = {"failed", "failure", "cancelled", "canceled", "error"}
+COVER_CROP_ONLY_DOMAINS = {"eliaselias.dk"}
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -51,6 +55,15 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
     raw_value = os.getenv(name, str(default)).strip()
     try:
         value = int(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw_value)
     except ValueError:
         return default
     return max(minimum, value)
@@ -94,6 +107,23 @@ def download_image(url: str) -> Image.Image:
 def save_jpeg(image: Image.Image, path: Path, quality: int = 95) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     to_rgb(image).save(path, "JPEG", quality=quality, optimize=True)
+
+
+def resize_to_max_pixels(image: Image.Image, max_pixels: int) -> tuple[Image.Image, bool]:
+    image = to_rgb(image)
+    width, height = image.size
+    if width * height <= max_pixels:
+        return image, False
+
+    scale = (max_pixels / float(width * height)) ** 0.5
+    resized_width = max(1, int(width * scale))
+    resized_height = max(1, int(height * scale))
+    while resized_width * resized_height > max_pixels:
+        if resized_width >= resized_height:
+            resized_width -= 1
+        else:
+            resized_height -= 1
+    return image.resize((resized_width, resized_height), Image.Resampling.LANCZOS), True
 
 
 def aspect_ratio(image: Image.Image) -> float:
@@ -254,12 +284,15 @@ def ark_api_key() -> str:
 
 
 def expand_prompt(description: str) -> str:
-    base_rule = (
-        "Only expand the edges to make a clean 3:4 product photograph. Keep the original furniture "
-        "unchanged. Extend the wall, floor, lighting, and background naturally. Do not add text, people, "
-        "extra furniture, UI elements, logos, or unrelated objects."
+    return (
+        "Outpaint the provided image to a 3:4 product photograph by extending only the existing edge "
+        "pixels, textures, perspective lines, wall, floor, and lighting already visible in the source. "
+        "Preserve the original product exactly. Do not add, invent, complete, repair, redesign, or "
+        "supplement anything. Do not add blocks, patches, panels, corners, trim, decorations, props, "
+        "extra furniture, people, text, logos, watermarks, UI elements, shadows, highlights, color fields, "
+        "or any object or background detail that is not directly implied by the source image edges. "
+        "The new canvas area must look like a seamless continuation of the existing image only."
     )
-    return f"{description}\n\n{base_rule}" if description else base_rule
 
 
 def duomi_request_json(method: str, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -279,12 +312,20 @@ def duomi_request_json(method: str, url: str, body: dict[str, Any] | None = None
     return payload
 
 
-def wait_for_duomi_task(task_id: str) -> dict[str, Any]:
+def wait_for_duomi_task(task_id: str, request_id_value: str | None = None, attempt: int = 1) -> dict[str, Any]:
     interval = float(os.getenv("DUOMI_POLL_INTERVAL", "5"))
     timeout = float(os.getenv("DUOMI_TIMEOUT", "600"))
     deadline = time.monotonic() + timeout
     started = time.monotonic()
     last_response: dict[str, Any] | None = None
+    logger.info(
+        "xhs stage=duomi_wait_start request_id=%s attempt=%d task_id=%s timeout=%.2fs interval=%.2fs",
+        request_id_value,
+        attempt,
+        task_id,
+        timeout,
+        interval,
+    )
     while time.monotonic() < deadline:
         last_response = duomi_request_json(
             "GET",
@@ -292,7 +333,14 @@ def wait_for_duomi_task(task_id: str) -> dict[str, Any]:
         )
         state = str(last_response.get("state", "")).lower()
         if state in TERMINAL_SUCCESS:
-            logger.info("xhs stage=duomi_wait task_id=%s elapsed=%.2fs", task_id, time.monotonic() - started)
+            logger.info(
+                "xhs stage=duomi_wait_done request_id=%s attempt=%d task_id=%s state=%s elapsed=%.2fs",
+                request_id_value,
+                attempt,
+                task_id,
+                state,
+                time.monotonic() - started,
+            )
             return last_response
         if state in TERMINAL_FAILURE:
             raise XHSPipelineError(f"Duomi task failed with state={state}: {last_response}")
@@ -310,8 +358,18 @@ def extract_duomi_image_url(payload: dict[str, Any]) -> str:
     raise XHSPipelineError(f"Duomi response did not include an image URL: {payload}")
 
 
-def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image:
+def expand_cover_with_duomi(
+    reference_url: str,
+    description: str,
+    request_id_value: str | None = None,
+    attempt: int = 1,
+) -> Image.Image:
     started = time.monotonic()
+    logger.info(
+        "xhs stage=duomi_expand_start request_id=%s attempt=%d",
+        request_id_value,
+        attempt,
+    )
     submitted = duomi_request_json(
         "POST",
         DUOMI_CREATE_URL,
@@ -325,10 +383,22 @@ def expand_cover_with_duomi(reference_url: str, description: str) -> Image.Image
     task_id = submitted.get("id")
     if not task_id:
         raise XHSPipelineError(f"Duomi create response did not include task id: {submitted}")
-    final = wait_for_duomi_task(str(task_id))
+    logger.info(
+        "xhs stage=duomi_expand_submitted request_id=%s attempt=%d task_id=%s",
+        request_id_value,
+        attempt,
+        task_id,
+    )
+    final = wait_for_duomi_task(str(task_id), request_id_value, attempt)
     generated_url = extract_duomi_image_url(final)
     image = download_image(generated_url)
-    logger.info("xhs stage=duomi_expand elapsed=%.2fs", time.monotonic() - started)
+    logger.info(
+        "xhs stage=duomi_expand_done request_id=%s attempt=%d task_id=%s elapsed=%.2fs",
+        request_id_value,
+        attempt,
+        task_id,
+        time.monotonic() - started,
+    )
     return image
 
 
@@ -349,8 +419,22 @@ def extract_ark_image_url(payload: dict[str, Any]) -> str:
     raise XHSPipelineError(f"Ark response did not include an image URL: {payload}")
 
 
-def expand_cover_with_ark(reference_url: str, description: str) -> Image.Image:
+def expand_cover_with_ark(
+    reference_url: str,
+    description: str,
+    request_id_value: str | None = None,
+    attempt: int = 1,
+) -> Image.Image:
     started = time.monotonic()
+    timeout = float(os.getenv("ARK_IMAGE_TIMEOUT", "600"))
+    logger.info(
+        "xhs stage=ark_expand_start request_id=%s attempt=%d model=%s size=%s timeout=%.2fs",
+        request_id_value,
+        attempt,
+        os.getenv("ARK_IMAGE_MODEL", DEFAULT_ARK_IMAGE_MODEL),
+        os.getenv("ARK_IMAGE_SIZE", DEFAULT_ARK_IMAGE_SIZE),
+        timeout,
+    )
     response = requests.post(
         os.getenv("ARK_IMAGE_GENERATION_URL", ARK_IMAGE_GENERATION_URL),
         headers={
@@ -367,7 +451,7 @@ def expand_cover_with_ark(reference_url: str, description: str) -> Image.Image:
             "stream": False,
             "watermark": False,
         },
-        timeout=float(os.getenv("ARK_IMAGE_TIMEOUT", "600")),
+        timeout=timeout,
     )
     if response.status_code >= 400:
         raise XHSPipelineError(f"Ark HTTP {response.status_code}: {response.text[:500]}")
@@ -379,7 +463,12 @@ def expand_cover_with_ark(reference_url: str, description: str) -> Image.Image:
         raise XHSPipelineError(f"Ark returned unexpected response: {payload!r}")
     generated_url = extract_ark_image_url(payload)
     image = download_image(generated_url)
-    logger.info("xhs stage=ark_expand elapsed=%.2fs", time.monotonic() - started)
+    logger.info(
+        "xhs stage=ark_expand_done request_id=%s attempt=%d elapsed=%.2fs",
+        request_id_value,
+        attempt,
+        time.monotonic() - started,
+    )
     return image
 
 
@@ -392,40 +481,213 @@ def expand_enabled() -> bool:
     return env_bool("XHS_USE_EXPAND", env_bool("XHS_USE_DUOMI_EXPAND", True))
 
 
-def expand_cover(reference_url: str, description: str) -> tuple[str, Image.Image]:
+def ark_reference_max_pixels() -> int:
+    return env_int("ARK_REFERENCE_MAX_PIXELS", DEFAULT_ARK_REFERENCE_MAX_PIXELS)
+
+
+def normalized_hostname(url: str) -> str:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname.removeprefix("www.")
+
+
+def host_matches_domain(hostname: str, domain: str) -> bool:
+    hostname = hostname.removeprefix("www.")
+    domain = domain.lower().removeprefix("www.")
+    return hostname == domain or hostname.endswith(f".{domain}")
+
+
+def cover_crop_only_reason(product: dict[str, Any], image_url: str) -> str:
+    urls = [
+        str(product.get("source_url") or ""),
+        str(product.get("page_url") or ""),
+        str(product.get("url") or ""),
+        image_url,
+    ]
+    for url in urls:
+        hostname = normalized_hostname(url)
+        if not hostname:
+            continue
+        for domain in COVER_CROP_ONLY_DOMAINS:
+            if host_matches_domain(hostname, domain):
+                return f"source domain {domain} uses direct 3:4 crop"
+    return ""
+
+
+def expand_cover(
+    reference_url: str,
+    description: str,
+    request_id_value: str | None = None,
+    attempt: int = 1,
+) -> tuple[str, Image.Image]:
     provider = expand_provider()
     if provider == "ark":
-        return provider, expand_cover_with_ark(reference_url, description)
+        return provider, expand_cover_with_ark(reference_url, description, request_id_value, attempt)
     if provider == "duomi":
-        return provider, expand_cover_with_duomi(reference_url, description)
+        return provider, expand_cover_with_duomi(reference_url, description, request_id_value, attempt)
     raise XHSPipelineError(f"Unsupported XHS_EXPAND_PROVIDER: {provider}")
 
 
-def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tuple[int, Path, dict[str, Any]]:
+def expand_max_attempts() -> int:
+    return env_int("XHS_EXPAND_MAX_ATTEMPTS", 3)
+
+
+def expand_retry_delay() -> float:
+    return env_float("XHS_EXPAND_RETRY_DELAY", 5.0)
+
+
+def expand_cover_with_retries(
+    original_path: Path,
+    product: dict[str, Any],
+    request_id_value: str | None = None,
+    job_id: str | None = None,
+) -> tuple[str, Image.Image, str, int]:
+    attempts = expand_max_attempts()
+    delay = expand_retry_delay()
+    last_error: Exception | None = None
+    text = product_text(product)
+    for attempt in range(1, attempts + 1):
+        attempt_started = time.monotonic()
+        try:
+            logger.info(
+                "xhs stage=cover_expand_attempt_start request_id=%s job_id=%s attempt=%d max_attempts=%d provider=%s",
+                request_id_value,
+                job_id,
+                attempt,
+                attempts,
+                expand_provider(),
+            )
+            reference_session = session()
+            reference_url = upload_to_superbed(original_path, reference_session)
+            provider, image = expand_cover(reference_url, text, request_id_value, attempt)
+            logger.info(
+                "xhs stage=cover_expand_attempt_done request_id=%s job_id=%s attempt=%d provider=%s elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                provider,
+                time.monotonic() - attempt_started,
+            )
+            return provider, image, reference_url, attempt
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "xhs stage=cover_expand_attempt_failed request_id=%s job_id=%s attempt=%d max_attempts=%d provider=%s elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                attempts,
+                expand_provider(),
+                time.monotonic() - attempt_started,
+            )
+            if attempt < attempts and delay > 0:
+                time.sleep(delay)
+    raise XHSPipelineError(f"Cover expansion failed after {attempts} attempts: {last_error}") from last_error
+
+
+def xhs_copy_max_attempts() -> int:
+    raw_value = os.getenv("XHS_COPY_MAX_ATTEMPTS", "3").strip()
+    try:
+        return max(1, min(5, int(raw_value)))
+    except ValueError:
+        return 3
+
+
+def xhs_copy_retry_delay() -> float:
+    return env_float("XHS_COPY_RETRY_DELAY", 1.0)
+
+
+def xhs_publish_max_attempts() -> int:
+    raw_value = os.getenv("XHS_PUBLISH_MAX_ATTEMPTS", "3").strip()
+    try:
+        return max(1, min(5, int(raw_value)))
+    except ValueError:
+        return 3
+
+
+def xhs_publish_retry_delay() -> float:
+    return env_float("XHS_PUBLISH_RETRY_DELAY", 2.0)
+
+
+def process_cover(
+    image_url: str,
+    job_dir: Path,
+    product: dict[str, Any],
+    request_id_value: str | None = None,
+    job_id: str | None = None,
+) -> tuple[int, Path, dict[str, Any]]:
+    started = time.monotonic()
     original_dir = job_dir / "xhs_originals"
     processed_dir = job_dir / "xhs_processed"
     original_path = original_dir / "original_cover.jpg"
+    logger.info(
+        "xhs stage=cover_process_start request_id=%s job_id=%s source_host=%s",
+        request_id_value,
+        job_id,
+        urlparse(image_url).netloc,
+    )
     image = download_image(image_url)
     save_jpeg(image, original_path)
     meta: dict[str, Any] = {"source_url": image_url, "original_path": str(original_path)}
+    expand_reference_path = original_path
+    ratio = aspect_ratio(image)
+    logger.info(
+        "xhs stage=cover_downloaded request_id=%s job_id=%s size=%sx%s ratio=%.4f",
+        request_id_value,
+        job_id,
+        image.size[0],
+        image.size[1],
+        ratio,
+    )
 
-    if abs(aspect_ratio(image) - TARGET_RATIO) > 0.01:
-        try:
-            if expand_enabled():
-                reference_session = session()
-                reference_url = upload_to_superbed(original_path, reference_session)
-                provider, image = expand_cover(reference_url, product_text(product))
-                meta["expand_provider"] = provider
-                meta["expand_reference_url"] = reference_url
-                meta["expanded"] = True
-            else:
-                meta["expanded"] = False
-                meta["expand_skipped"] = "XHS_USE_EXPAND is disabled"
-                image = crop_to_3_4(image)
-        except Exception as exc:
+    if abs(ratio - TARGET_RATIO) > 0.01:
+        crop_only_reason = cover_crop_only_reason(product, image_url)
+        if crop_only_reason:
             meta["expanded"] = False
-            meta["expand_provider"] = expand_provider()
-            meta["expand_error"] = str(exc)
+            meta["expand_skipped"] = crop_only_reason
+            image = crop_to_3_4(image)
+            logger.info(
+                "xhs stage=cover_expand_skipped request_id=%s job_id=%s reason=%s",
+                request_id_value,
+                job_id,
+                crop_only_reason,
+            )
+        elif expand_enabled():
+            provider = expand_provider()
+            if provider == "ark":
+                max_pixels = ark_reference_max_pixels()
+                reference_image, resized = resize_to_max_pixels(image, max_pixels)
+                if resized:
+                    original_width, original_height = image.size
+                    reference_width, reference_height = reference_image.size
+                    expand_reference_path = original_dir / "ark_reference_cover.jpg"
+                    save_jpeg(reference_image, expand_reference_path)
+                    meta["ark_reference_path"] = str(expand_reference_path)
+                    meta["ark_reference_original_size"] = f"{original_width}x{original_height}"
+                    meta["ark_reference_size"] = f"{reference_width}x{reference_height}"
+                    meta["ark_reference_max_pixels"] = max_pixels
+                    logger.info(
+                        "xhs stage=cover_ark_reference_resized request_id=%s job_id=%s original_size=%sx%s reference_size=%sx%s max_pixels=%d",
+                        request_id_value,
+                        job_id,
+                        original_width,
+                        original_height,
+                        reference_width,
+                        reference_height,
+                        max_pixels,
+                    )
+            provider, image, reference_url, attempts_used = expand_cover_with_retries(
+                expand_reference_path,
+                product,
+                request_id_value,
+                job_id,
+            )
+            meta["expand_provider"] = provider
+            meta["expand_reference_url"] = reference_url
+            meta["expand_attempts"] = attempts_used
+            meta["expanded"] = True
+        else:
+            meta["expanded"] = False
+            meta["expand_skipped"] = "XHS_USE_EXPAND is disabled"
             image = crop_to_3_4(image)
     else:
         meta["expanded"] = False
@@ -434,23 +696,57 @@ def process_cover(image_url: str, job_dir: Path, product: dict[str, Any]) -> tup
     image = add_logo(image, choose_logo_style_by_background(image))
     output_path = processed_dir / "cover_3x4_logo.jpg"
     save_jpeg(image, output_path)
+    logger.info(
+        "xhs stage=cover_process_done request_id=%s job_id=%s expanded=%s elapsed=%.2fs",
+        request_id_value,
+        job_id,
+        meta["expanded"],
+        time.monotonic() - started,
+    )
     return 0, output_path, meta
 
 
-def process_gallery_image(index: int, image_url: str, job_dir: Path) -> tuple[int, Path, dict[str, Any]]:
+def process_gallery_image(
+    index: int,
+    image_url: str,
+    job_dir: Path,
+    request_id_value: str | None = None,
+    job_id: str | None = None,
+) -> tuple[int, Path, dict[str, Any]]:
+    started = time.monotonic()
     original_dir = job_dir / "xhs_originals"
     processed_dir = job_dir / "xhs_processed"
     original_path = original_dir / f"original_{index + 1:02d}.jpg"
+    logger.info(
+        "xhs stage=gallery_process_start request_id=%s job_id=%s index=%d source_host=%s",
+        request_id_value,
+        job_id,
+        index,
+        urlparse(image_url).netloc,
+    )
     image = download_image(image_url)
     save_jpeg(image, original_path)
     image = crop_to_3_4(image)
     image = add_logo(image, choose_logo_style_by_background(image))
     output_path = processed_dir / f"image_{index + 1:02d}_3x4_logo.jpg"
     save_jpeg(image, output_path)
+    logger.info(
+        "xhs stage=gallery_process_done request_id=%s job_id=%s index=%d elapsed=%.2fs",
+        request_id_value,
+        job_id,
+        index,
+        time.monotonic() - started,
+    )
     return index, output_path, {"source_url": image_url, "original_path": str(original_path)}
 
 
-def process_images_for_xhs(image_urls: list[str], product: dict[str, Any], job_dir: Path) -> tuple[list[Path], list[dict[str, Any]]]:
+def process_images_for_xhs(
+    image_urls: list[str],
+    product: dict[str, Any],
+    job_dir: Path,
+    request_id_value: str | None = None,
+    job_id: str | None = None,
+) -> tuple[list[Path], list[dict[str, Any]]]:
     started = time.monotonic()
     image_urls = [url for url in image_urls if url][:12]
     if not image_urls:
@@ -459,16 +755,29 @@ def process_images_for_xhs(image_urls: list[str], product: dict[str, Any], job_d
     workers = min(env_int("XHS_IMAGE_PROCESS_CONCURRENCY", 20), len(image_urls))
     results: dict[int, Path] = {}
     metadata: dict[int, dict[str, Any]] = {}
+    logger.info(
+        "xhs stage=process_images_start request_id=%s job_id=%s images=%d workers=%d expand_enabled=%s provider=%s",
+        request_id_value,
+        job_id,
+        len(image_urls),
+        workers,
+        expand_enabled(),
+        expand_provider(),
+    )
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_cover, image_urls[0], job_dir, product): 0}
+        futures = {
+            executor.submit(process_cover, image_urls[0], job_dir, product, request_id_value, job_id): 0
+        }
         for index, image_url in enumerate(image_urls[1:], start=1):
-            futures[executor.submit(process_gallery_image, index, image_url, job_dir)] = index
+            futures[executor.submit(process_gallery_image, index, image_url, job_dir, request_id_value, job_id)] = index
         for future in as_completed(futures):
             index, path, meta = future.result()
             results[index] = path
             metadata[index] = meta
     logger.info(
-        "xhs stage=process_images images=%d workers=%d elapsed=%.2fs",
+        "xhs stage=process_images_done request_id=%s job_id=%s images=%d workers=%d elapsed=%.2fs",
+        request_id_value,
+        job_id,
         len(image_urls),
         workers,
         time.monotonic() - started,
@@ -476,14 +785,35 @@ def process_images_for_xhs(image_urls: list[str], product: dict[str, Any], job_d
     return [results[index] for index in sorted(results)], [metadata[index] for index in sorted(metadata)]
 
 
-def deepseek_api_key() -> str:
-    value = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not value:
-        raise XHSPipelineError("DEEPSEEK_API_KEY is not configured")
-    return value
+def extract_response_text(payload: dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    texts: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text.strip())
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+
+    if texts:
+        return "\n".join(texts).strip()
+    raise XHSPipelineError(f"Ark responses output did not include text: {payload}")
 
 
-def generate_xhs_copy(product: dict[str, Any]) -> tuple[str, str]:
+def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = None, job_id: str | None = None) -> tuple[str, str]:
     started = time.monotonic()
     system_prompt = """你是旨丘画廊的CMO，请为这件作品写一段文案用于小红书（标题及内容）要求如下：
 
@@ -513,41 +843,101 @@ def generate_xhs_copy(product: dict[str, Any]) -> tuple[str, str]:
 9、文案中只允许出现"旨丘"作为店铺/品牌名称，禁止出现其他任何店铺名、网站名、出品方名称。
 10、正文部分除产品名称外禁止出现不必要英文单词。"""
     user_prompt = f"这是产品的详细信息：\n{product_text(product)}\n\n请根据以上信息生成小红书标题和正文。"
-    base_url = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com").rstrip("/")
-    response = requests.post(
-        f"{base_url}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {deepseek_api_key()}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.7,
-        },
-        timeout=120,
-    )
-    if response.status_code >= 400:
-        raise XHSPipelineError(f"DeepSeek HTTP {response.status_code}: {response.text[:500]}")
-    payload = response.json()
-    content = str(payload["choices"][0]["message"]["content"]).strip()
-    parts = [part.strip() for part in content.splitlines() if part.strip()]
-    if not parts:
-        raise XHSPipelineError("DeepSeek returned empty content")
-    title = parts[0]
-    body = content[len(title) :].strip()
-    logger.info("xhs stage=generate_copy elapsed=%.2fs", time.monotonic() - started)
-    return title, body or content
+    model = os.getenv("XHS_COPY_MODEL") or os.getenv("DEEPSEEK_MODEL") or DEFAULT_XHS_COPY_MODEL
+    url = os.getenv("ARK_RESPONSES_URL", ARK_RESPONSES_URL)
+    attempts = xhs_copy_max_attempts()
+    retry_delay = xhs_copy_retry_delay()
+    prompt_base = f"{system_prompt}\n\n{user_prompt}"
+    headers = {
+        "Authorization": f"Bearer {ark_api_key()}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(1, attempts + 1):
+        attempt_started = time.monotonic()
+        logger.info(
+            "xhs stage=generate_copy_attempt_start request_id=%s job_id=%s attempt=%d max_attempts=%d provider=ark model=%s",
+            request_id_value,
+            job_id,
+            attempt,
+            attempts,
+            model,
+        )
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "stream": False,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt_base,
+                                }
+                            ],
+                        }
+                    ],
+                },
+                timeout=120,
+            )
+            if response.status_code >= 400:
+                raise XHSPipelineError(f"Ark responses HTTP {response.status_code}: {response.text[:500]}")
+            payload = response.json()
+            content = extract_response_text(payload)
+            parts = [part.strip() for part in content.splitlines() if part.strip()]
+            if not parts:
+                raise XHSPipelineError("Ark responses returned empty content")
+            title = parts[0]
+            body = content[len(title) :].strip()
+            if not body:
+                raise XHSPipelineError("Ark responses returned incomplete XHS copy")
+            logger.info(
+                "xhs stage=generate_copy_attempt_done request_id=%s job_id=%s attempt=%d title=%r elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                title,
+                time.monotonic() - attempt_started,
+            )
+            logger.info(
+                "xhs stage=generate_copy_done request_id=%s job_id=%s title=%r attempts=%d elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                title,
+                attempt,
+                time.monotonic() - started,
+            )
+            return title, body
+        except (requests.RequestException, KeyError, IndexError, TypeError, ValueError, XHSPipelineError) as exc:
+            logger.warning(
+                "xhs stage=generate_copy_attempt_failed request_id=%s job_id=%s attempt=%d max_attempts=%d error=%r elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                attempts,
+                str(exc),
+                time.monotonic() - attempt_started,
+            )
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    raise XHSPipelineError(f"Ark responses returned invalid XHS copy after {attempts} attempts")
 
 
 def xhs_api_base() -> str:
     return os.getenv("XHS_POST_API_BASE", DEFAULT_XHS_POST_API_BASE).rstrip("/")
 
 
-def publish_xhs_note(title: str, content: str, image_paths: list[Path]) -> tuple[dict[str, Any], str]:
+def publish_xhs_note(
+    title: str,
+    content: str,
+    image_paths: list[Path],
+    request_id_value: str | None = None,
+    job_id: str | None = None,
+) -> tuple[dict[str, Any], str]:
     started = time.monotonic()
     api_base = xhs_api_base()
     identifier = f"product-scraper-xhs-{int(time.time())}"
@@ -559,50 +949,131 @@ def publish_xhs_note(title: str, content: str, image_paths: list[Path]) -> tuple
         "activityId": identifier,
         "userId": "1",
     }
-    with ExitStack() as stack:
-        files = []
-        for path in image_paths:
-            handle = stack.enter_context(path.open("rb"))
-            files.append(
-                (
-                    "images",
-                    (path.name, handle, mimetypes.guess_type(path.name)[0] or "image/jpeg"),
-                )
-            )
-        response = requests.post(
-            f"{api_base}/api/xhs-auto/notes",
-            headers={"x-api-key": os.getenv("XHS_POST_API_KEY", DEFAULT_XHS_POST_API_KEY)},
-            data=data,
-            files=files,
-            timeout=240,
+    logger.info(
+        "xhs stage=publish_start request_id=%s job_id=%s images=%d title=%r",
+        request_id_value,
+        job_id,
+        len(image_paths),
+        title,
+    )
+    ordered_paths: list[Path] = []
+    for index, path in enumerate(image_paths, start=1):
+        ordered_path = path.with_name(f"{index:02d}_{path.name}")
+        if ordered_path != path:
+            shutil.copy2(path, ordered_path)
+        ordered_paths.append(ordered_path)
+    logger.info(
+        "xhs stage=publish_image_order request_id=%s job_id=%s files=%s",
+        request_id_value,
+        job_id,
+        [path.name for path in ordered_paths],
+    )
+    attempts = xhs_publish_max_attempts()
+    retry_delay = xhs_publish_retry_delay()
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        attempt_started = time.monotonic()
+        logger.info(
+            "xhs stage=publish_attempt_start request_id=%s job_id=%s attempt=%d max_attempts=%d images=%d title=%r",
+            request_id_value,
+            job_id,
+            attempt,
+            attempts,
+            len(image_paths),
+            title,
         )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise XHSPipelineError(f"XHS publisher returned non-JSON response: {response.text[:500]}") from exc
-    if response.status_code >= 400 or payload.get("code") != 200:
-        raise XHSPipelineError(f"XHS publisher failed: HTTP {response.status_code}: {payload}")
-    note_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    share_link = str(note_data.get("shareLink") or "")
-    if not share_link and note_data.get("id"):
-        share_link = f"{api_base}/#/xhs-auto-api?id={note_data['id']}"
-    if not share_link:
-        raise XHSPipelineError(f"XHS publisher response did not include shareLink: {payload}")
-    logger.info("xhs stage=publish images=%d elapsed=%.2fs", len(image_paths), time.monotonic() - started)
-    return payload, share_link
+        try:
+            with ExitStack() as stack:
+                files = []
+                for path in ordered_paths:
+                    handle = stack.enter_context(path.open("rb"))
+                    files.append(
+                        (
+                            "images",
+                            (path.name, handle, mimetypes.guess_type(path.name)[0] or "image/jpeg"),
+                        )
+                    )
+                response = requests.post(
+                    f"{api_base}/api/xhs-auto/notes",
+                    headers={"x-api-key": os.getenv("XHS_POST_API_KEY", DEFAULT_XHS_POST_API_KEY)},
+                    data=data,
+                    files=files,
+                    timeout=240,
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise XHSPipelineError(f"XHS publisher returned non-JSON response: {response.text[:500]}") from exc
+            if response.status_code >= 400 or payload.get("code") != 200:
+                raise XHSPipelineError(f"XHS publisher failed: HTTP {response.status_code}: {payload}")
+            note_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            share_link = str(note_data.get("shareLink") or "")
+            if not share_link and note_data.get("id"):
+                share_link = f"{api_base}/#/xhs-auto-api?id={note_data['id']}"
+            if not share_link:
+                raise XHSPipelineError(f"XHS publisher response did not include shareLink: {payload}")
+            logger.info(
+                "xhs stage=publish_attempt_done request_id=%s job_id=%s attempt=%d images=%d elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                len(image_paths),
+                time.monotonic() - attempt_started,
+            )
+            logger.info(
+                "xhs stage=publish_done request_id=%s job_id=%s images=%d attempts=%d elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                len(image_paths),
+                attempt,
+                time.monotonic() - started,
+            )
+            return payload, share_link
+        except (requests.RequestException, ValueError, KeyError, TypeError, XHSPipelineError) as exc:
+            last_error = exc
+            logger.warning(
+                "xhs stage=publish_attempt_failed request_id=%s job_id=%s attempt=%d max_attempts=%d error=%r elapsed=%.2fs",
+                request_id_value,
+                job_id,
+                attempt,
+                attempts,
+                str(exc),
+                time.monotonic() - attempt_started,
+            )
+            if attempt < attempts and retry_delay > 0:
+                time.sleep(retry_delay)
+
+    raise XHSPipelineError(f"XHS publisher failed after {attempts} attempts: {last_error}") from last_error
 
 
-def create_xhs_note(product: dict[str, Any], job_id: str, job_dir: Path) -> XHSPipelineResult:
+def create_xhs_note(
+    product: dict[str, Any],
+    job_id: str,
+    job_dir: Path,
+    request_id_value: str | None = None,
+) -> XHSPipelineResult:
     started = time.monotonic()
     image_urls = list(product.get("image_links") or [])
+    logger.info(
+        "xhs event=started request_id=%s job_id=%s images=%d product_name=%r",
+        request_id_value,
+        job_id,
+        len(image_urls),
+        product.get("name", ""),
+    )
     parallel_started = time.monotonic()
     with ThreadPoolExecutor(max_workers=2) as executor:
-        image_future = executor.submit(process_images_for_xhs, image_urls, product, job_dir)
-        copy_future = executor.submit(generate_xhs_copy, product)
+        image_future = executor.submit(process_images_for_xhs, image_urls, product, job_dir, request_id_value, job_id)
+        copy_future = executor.submit(generate_xhs_copy, product, request_id_value, job_id)
         processed_paths, image_metadata = image_future.result()
         title, content = copy_future.result()
-    logger.info("xhs stage=parallel_prepare elapsed=%.2fs", time.monotonic() - parallel_started)
-    publish_response, share_link = publish_xhs_note(title, content, processed_paths)
+    logger.info(
+        "xhs stage=parallel_prepare_done request_id=%s job_id=%s elapsed=%.2fs",
+        request_id_value,
+        job_id,
+        time.monotonic() - parallel_started,
+    )
+    publish_response, share_link = publish_xhs_note(title, content, processed_paths, request_id_value, job_id)
     qrcode_link = f"{xhs_api_base()}/api/html-render/qrcode?size=320&data={quote(share_link, safe='')}"
 
     result = {
@@ -618,7 +1089,8 @@ def create_xhs_note(product: dict[str, Any], job_id: str, job_dir: Path) -> XHSP
     (job_dir / "xhs_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     shutil.rmtree(job_dir / "xhs_originals", ignore_errors=True)
     logger.info(
-        "xhs stage=total job_id=%s images=%d elapsed=%.2fs",
+        "xhs event=done request_id=%s job_id=%s images=%d elapsed=%.2fs",
+        request_id_value,
         job_id,
         len(image_urls),
         time.monotonic() - started,

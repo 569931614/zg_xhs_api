@@ -2,6 +2,7 @@ const form = document.querySelector("#scrape-form");
 const statusEl = document.querySelector("#status");
 const resultEl = document.querySelector("#result");
 const nameEl = document.querySelector("#product-name");
+const priceEl = document.querySelector("#product-price");
 const dimensionsEl = document.querySelector("#product-dimensions");
 const descriptionEl = document.querySelector("#product-description");
 const detailsEl = document.querySelector("#product-details");
@@ -14,6 +15,7 @@ function setStatus(message) {
 function renderResult(data) {
   const productDetails = data.product_details || {};
   nameEl.textContent = data.name || "未识别商品名";
+  priceEl.textContent = data.price ? `价格：${data.price}${data.currency && !data.price.includes(data.currency) ? ` ${data.currency}` : ""}` : "";
   dimensionsEl.textContent = data.dimensions ? `尺寸：${data.dimensions}` : "";
   descriptionEl.textContent = productDetails.description || "";
   imagesEl.innerHTML = "";
