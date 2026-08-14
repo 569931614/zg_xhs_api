@@ -103,6 +103,48 @@ Content-Type: application/json
 
 服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。遇到 Cloudflare 真人验证页时，会在授权配置下尝试使用 DrissionPage + Chrome/Chromium fallback 获取通过验证后的 HTML。尺寸缺失不会阻断返回。
 
+### 获取拍卖商品列表
+
+```http
+POST /api/auction/list
+Content-Type: application/json
+```
+
+请求：
+
+```json
+{
+  "url": "https://drouot.com/zh/c/199/jia-ju",
+  "render": "auto",
+  "max_items": 50
+}
+```
+
+`max_items` 范围为 `1-100`。Drouot 分类页首屏通常返回当前页面已加载的拍品列表；遇到 Cloudflare / bot verification 时，`render=auto` 会自动启用 Cloudflare fallback。
+
+响应：
+
+```json
+{
+  "source_url": "https://drouot.com/zh/c/199/jia-ju",
+  "fetched_url": "https://drouot.com/zh/c/199/jia-ju",
+  "title": "家具",
+  "total_count": 5666,
+  "items": [
+    {
+      "lot_id": "34599005",
+      "title": "一款1960年代的柚木贴面斯堪的纳维亚风格餐桌...",
+      "url": "https://drouot.com/zh/l/34599005-kuan-1960nian-dai-de-you-mu-tie-mian-si-kan-de-na-wei-ya",
+      "image_link": "https://cdn.drouot.com/d/image/lot?size=ftall&path=...",
+      "sale_status": "live",
+      "sale_time": "8月14日 | 下午02:00",
+      "estimate": "€400 - 600",
+      "raw_text": "live 8月14日 | 下午02:00 ..."
+    }
+  ]
+}
+```
+
 ### 创建小红书笔记
 
 ```http

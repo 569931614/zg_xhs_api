@@ -47,6 +47,31 @@ class ScrapeBatchResponse(BaseModel):
     results: list[ScrapeBatchItem] = Field(default_factory=list)
 
 
+class AuctionListRequest(BaseModel):
+    url: HttpUrl
+    render: Literal["auto", "always", "never"] = "auto"
+    max_items: int = Field(default=50, ge=1, le=100)
+
+
+class AuctionLotItem(BaseModel):
+    lot_id: str = ""
+    title: str = ""
+    url: str
+    image_link: str = ""
+    sale_status: str = ""
+    sale_time: str = ""
+    estimate: str = ""
+    raw_text: str = ""
+
+
+class AuctionListResponse(BaseModel):
+    source_url: str
+    fetched_url: str
+    title: str = ""
+    total_count: int | None = None
+    items: list[AuctionLotItem] = Field(default_factory=list)
+
+
 class XHSCreateRequest(ScrapeRequest):
     pass
 

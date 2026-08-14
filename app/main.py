@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.schemas import (
+    AuctionListRequest,
+    AuctionListResponse,
     ScrapeBatchItem,
     ScrapeBatchResponse,
     ScrapeRequest,
@@ -33,6 +35,7 @@ from app.schemas import (
     XianyuCopyRequest,
     XianyuCopyResponse,
 )
+from app.services.auction_list import AuctionListError, extract_auction_list
 from app.services.extractor import extract
 from app.services.logging_config import configure_logging
 from app.services.storage import upload_images_to_superbed
@@ -526,6 +529,47 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse | ScrapeBatchRespon
 
     results = run_batch(payload.product_urls(), scrape_one, api_request_id, "/api/scrape")
     return ScrapeBatchResponse(results=results)
+
+
+@app.post("/api/auction/list", response_model=AuctionListResponse)
+def scrape_auction_list(payload: AuctionListRequest) -> AuctionListResponse:
+    api_request_id = request_id("api-auction-list")
+    started = time.monotonic()
+    url = strip_tracking_query(str(payload.url))
+    logger.info(
+        "api event=received request_id=%s endpoint=/api/auction/list render=%s max_items=%d url=%s",
+        api_request_id,
+        payload.render,
+        payload.max_items,
+        url_log_value(url),
+    )
+    validate_public_url(url)
+    try:
+        result = extract_auction_list(url, payload.render, payload.max_items)
+    except AuctionListError as exc:
+        logger.exception(
+            "api event=failed request_id=%s endpoint=/api/auction/list url=%s elapsed=%.2fs",
+            api_request_id,
+            url_log_value(url),
+            time.monotonic() - started,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to scrape auction list: {exc}") from exc
+    except Exception as exc:
+        logger.exception(
+            "api event=failed request_id=%s endpoint=/api/auction/list url=%s elapsed=%.2fs",
+            api_request_id,
+            url_log_value(url),
+            time.monotonic() - started,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to scrape auction list: {exc}") from exc
+
+    logger.info(
+        "api event=done request_id=%s endpoint=/api/auction/list items=%d elapsed=%.2fs",
+        api_request_id,
+        len(result.get("items") or []),
+        time.monotonic() - started,
+    )
+    return AuctionListResponse(**result)
 
 
 @app.post("/api/xhs/create", response_model=XHSCreateResponse | XHSCreateBatchResponse)
