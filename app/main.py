@@ -269,7 +269,12 @@ def run_scrape_url(
                     rendered,
                     url_log_value(url),
                 )
-                result = extract(url, rendered, payload.max_images)
+                result = extract(
+                    url,
+                    rendered,
+                    payload.max_images,
+                    allow_cloudflare_bypass=payload.render != "never",
+                )
             except Exception as exc:
                 if payload.render == "auto" and not rendered and should_retry_render(exc):
                     rendered = True
@@ -279,7 +284,12 @@ def run_scrape_url(
                         str(exc),
                         url_log_value(url),
                     )
-                    result = extract(url, True, payload.max_images)
+                    result = extract(
+                        url,
+                        True,
+                        payload.max_images,
+                        allow_cloudflare_bypass=payload.render != "never",
+                    )
                 else:
                     raise
             if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
@@ -291,7 +301,12 @@ def run_scrape_url(
                     product_has_dimensions(result),
                     url_log_value(url),
                 )
-                result = extract(url, True, payload.max_images)
+                result = extract(
+                    url,
+                    True,
+                    payload.max_images,
+                    allow_cloudflare_bypass=payload.render != "never",
+                )
             logger.info(
                 "scrape stage=extract_done request_id=%s url_host=%s rendered=%s images=%d name=%r dimensions=%s elapsed=%.2fs",
                 request_id_value,

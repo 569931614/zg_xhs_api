@@ -29,6 +29,12 @@ from urllib.request import url2pathname
 import requests
 from bs4 import BeautifulSoup
 
+from app.services.cloudflare import (
+    CloudflareBypassError,
+    fetch_cloudflare_bypassed,
+    is_cloudflare_blocked,
+)
+
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -2317,6 +2323,26 @@ def fetch_rendered(url: str) -> tuple[str, str]:
     return html, final_url
 
 
+def should_try_cloudflare_bypass_from_fetch_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in {401, 403, 429}:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "403",
+            "forbidden",
+            "401",
+            "unauthorized",
+            "429",
+            "cloudflare",
+            "security verification",
+        )
+    )
+
+
 def download_images(images: list[dict[str, Any]], out_dir: Path, session: requests.Session) -> None:
     image_dir = out_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -2341,7 +2367,12 @@ def download_images(images: list[dict[str, Any]], out_dir: Path, session: reques
             item["download_error"] = str(exc)
 
 
-def extract(url: str, render: bool, max_images: int) -> dict[str, Any]:
+def extract(
+    url: str,
+    render: bool,
+    max_images: int,
+    allow_cloudflare_bypass: bool = True,
+) -> dict[str, Any]:
     started = time.monotonic()
     max_images = max(1, min(max_images, MAX_PRODUCT_IMAGES))
     url = resolve_hash_project_url(url)
@@ -2364,13 +2395,44 @@ def extract(url: str, render: bool, max_images: int) -> dict[str, Any]:
         )
         return fast_result
 
-    html, final_url = fetch_rendered(url) if render else fetch_static(url)
+    try:
+        html, final_url = fetch_rendered(url) if render else fetch_static(url)
+    except Exception as exc:
+        if allow_cloudflare_bypass and should_try_cloudflare_bypass_from_fetch_error(exc):
+            logger.warning(
+                "extractor event=fetch_blocked_try_cloudflare host=%s render=%s reason=%r",
+                parsed.netloc,
+                render,
+                str(exc),
+            )
+            try:
+                html, final_url = fetch_cloudflare_bypassed(url)
+            except CloudflareBypassError as cf_exc:
+                raise RuntimeError(f"Blocked by Cloudflare/security verification page: {cf_exc}") from cf_exc
+        else:
+            raise
     soup = BeautifulSoup(html, "lxml")
     page_title = clean_text(soup.title.string if soup.title else "")
     body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
-    if page_title.lower() == "just a moment..." or "performing security verification" in body_text.lower():
-        logger.warning("extractor event=blocked host=%s final_url=%s title=%r", parsed.netloc, final_url, page_title)
-        raise RuntimeError("Blocked by Cloudflare/security verification page")
+    if is_cloudflare_blocked(page_title, body_text, html):
+        logger.warning(
+            "extractor event=blocked host=%s final_url=%s title=%r allow_cloudflare_bypass=%s",
+            parsed.netloc,
+            final_url,
+            page_title,
+            allow_cloudflare_bypass,
+        )
+        if allow_cloudflare_bypass:
+            try:
+                html, final_url = fetch_cloudflare_bypassed(final_url)
+                soup = BeautifulSoup(html, "lxml")
+                page_title = clean_text(soup.title.string if soup.title else "")
+                body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
+            except CloudflareBypassError as exc:
+                raise RuntimeError(f"Blocked by Cloudflare/security verification page: {exc}") from exc
+        if is_cloudflare_blocked(page_title, body_text, html):
+            logger.warning("extractor event=blocked_after_cloudflare host=%s final_url=%s title=%r", parsed.netloc, final_url, page_title)
+            raise RuntimeError("Blocked by Cloudflare/security verification page")
 
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)

@@ -8,3 +8,4 @@ playwright==1.49.1
 python-dotenv==1.0.1
 curl_cffi==0.7.4
 Pillow==10.4.0
+DrissionPage==4.1.0.17

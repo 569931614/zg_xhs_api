@@ -6,6 +6,7 @@
 
 - FastAPI：对外提供 HTTP API，部署简单。
 - Playwright：处理 React / Next.js 等 JS 渲染商品页。
+- DrissionPage + Chrome/Chromium：在授权场景下处理 Cloudflare 真人验证页。
 - BeautifulSoup + JSON-LD：优先读取结构化商品数据，速度快。
 - PM2：用于线上进程守护和日志查看。
 
@@ -19,6 +20,8 @@ pip install -r requirements.txt
 playwright install chromium
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+如果需要处理 Cloudflare 真人验证页，本机或服务器还需要安装 Chrome/Chromium。无法自动识别浏览器路径时，在 `.env` 中设置 `CF_BROWSER_PATH`。
 
 打开：
 
@@ -98,7 +101,7 @@ Content-Type: application/json
 - `dimensions`：尺寸
 - `product_details`：产品详情，包含描述和其他可识别详情字段
 
-服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。尺寸缺失不会阻断返回。
+服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。遇到 Cloudflare 真人验证页时，会在授权配置下尝试使用 DrissionPage + Chrome/Chromium fallback 获取通过验证后的 HTML。尺寸缺失不会阻断返回。
 
 ### 创建小红书笔记
 
@@ -192,13 +195,15 @@ Content-Type: application/json
 `product_type` 为产品类型，例如 `灯具`、`椅子`、`长凳`。
 `image_links` 为获取到的产品图链接，保持原顺序返回。
 
-遇到 Cloudflare / bot verification 等服务端无法通过的反爬页面时，接口会返回 `502`，错误信息类似：
+遇到 Cloudflare / bot verification 等页面时，服务会自动尝试 Cloudflare fallback。fallback 未安装依赖、缺少浏览器、验证未通过或被禁用时，接口会返回 `502`，错误信息类似：
 
 ```json
 {
   "detail": "Failed to scrape page: Blocked by Cloudflare/security verification page"
 }
 ```
+
+Cloudflare fallback 只在 `render=auto` 或 `render=always` 时启用；`render=never` 会保持只静态抓取。
 
 ## 图片链接
 
@@ -221,6 +226,15 @@ IMAGE_UPLOAD_TOTAL_CONCURRENCY=12
 SCRAPE_CONCURRENCY=3
 BATCH_CONCURRENCY=2
 RENDER_CONCURRENCY=2
+CF_BYPASS_ENABLED=true
+CF_BYPASS_CONCURRENCY=1
+CF_BYPASS_RETRIES=8
+CF_BYPASS_WAIT=8
+CF_BYPASS_PAGE_TIMEOUT=60
+CF_BYPASS_HEADLESS=false
+CF_BROWSER_PATH=
+CF_TURNSTILE_EXTENSION_PATH=
+CF_UA_EXTENSION_PATH=
 XHS_IMAGE_PROCESS_CONCURRENCY=20
 XHS_USE_EXPAND=true
 XHS_EXPAND_PROVIDER=ark
@@ -261,6 +275,13 @@ XHS_POST_API_KEY=xhs_post
 - `SCRAPE_CONCURRENCY`：同时执行完整抓取流程的请求数，默认 `3`
 - `BATCH_CONCURRENCY`：单个批量请求内同时处理的商品链接数，默认 `2`
 - `RENDER_CONCURRENCY`：同时启动 Playwright 浏览器渲染的请求数，默认 `2`
+- `CF_BYPASS_ENABLED`：是否在 Cloudflare 验证页启用授权浏览器 fallback，默认 `true`
+- `CF_BYPASS_CONCURRENCY`：同时运行 Cloudflare fallback 浏览器的数量，默认 `1`
+- `CF_BYPASS_RETRIES`：验证按钮点击/等待次数，默认 `8`
+- `CF_BYPASS_WAIT`：验证后额外等待秒数，默认 `8`
+- `CF_BYPASS_PAGE_TIMEOUT`：Cloudflare fallback 单次页面加载超时秒数，默认 `60`
+- `CF_BYPASS_HEADLESS`：Cloudflare fallback 是否无头运行，默认 `false`
+- `CF_BROWSER_PATH`：Chrome/Chromium/Edge 可执行文件路径，自动识别失败时填写
 - `IMAGE_UPLOAD_CONCURRENCY`：单个请求内并发上传图片数，默认 `6`
 - `IMAGE_UPLOAD_TOTAL_CONCURRENCY`：全服务同时上传图片数，默认 `12`
 - `XHS_IMAGE_PROCESS_CONCURRENCY`：小红书图片下载/裁剪/加 logo 的并发数，默认 `20`
@@ -295,6 +316,14 @@ python3 -m venv .venv
 pip install -r requirements.txt
 playwright install chromium
 ```
+
+如需 Cloudflare fallback，在服务器安装 Chrome/Chromium，并按需配置：
+
+```bash
+google-chrome --version || chromium --version
+```
+
+无桌面环境时建议使用 Xvfb 或将 `CF_BYPASS_HEADLESS=true` 后测试目标站点是否能通过验证。部分 Cloudflare 验证在无头模式下可能仍会失败。
 
 用 PM2 启动：
 
