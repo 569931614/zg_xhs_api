@@ -116,29 +116,59 @@ Content-Type: application/json
 {
   "url": "https://drouot.com/zh/c/199/jia-ju",
   "render": "auto",
-  "max_items": 50
+  "max_items": 50,
+  "max_pages": 0,
+  "save_to_db": true
 }
 ```
 
-`max_items` 范围为 `1-100`。Drouot 分类页首屏通常返回当前页面已加载的拍品列表；遇到 Cloudflare / bot verification 时，`render=auto` 会自动启用 Cloudflare fallback。
+拍卖网站数据直接通过 Drouot API 获取，例如：
+
+```text
+https://api.drouot.com/drouot/gingolem/neoGingo/lot/search?lang=zh&cat=199&page=1&facet=false
+```
+
+接口支持传 Drouot 分类页 URL，也支持直接传上面的 API URL。服务会从 `page=1` 开始递增请求，每页预期 100 条；当某页 `lots` 数量小于 100 时，认为已经到最后一页并停止。
+
+参数说明：
+
+- `max_items`：接口响应里返回的预览条数，范围 `1-100`；完整数据写入 SQLite。
+- `max_pages`：最多抓取页数，`0` 表示不限页数，一直抓到最后一页。
+- `save_to_db`：是否保存到 SQLite，默认 `true`。
+- `render`：为兼容旧调用保留，Drouot API 抓取不需要浏览器渲染。
+
+SQLite 默认保存到 `SCRAPER_DATA_DIR/auction_lots.sqlite3`，可用 `AUCTION_DB_PATH` 指定路径。
 
 响应：
 
 ```json
 {
   "source_url": "https://drouot.com/zh/c/199/jia-ju",
-  "fetched_url": "https://drouot.com/zh/c/199/jia-ju",
-  "title": "家具",
+  "fetched_url": "https://api.drouot.com/drouot/gingolem/neoGingo/lot/search?lang=zh&cat=199&page=1&facet=false",
+  "title": "Drouot category 199",
   "total_count": 5666,
+  "pages_fetched": 57,
+  "saved_count": 5666,
+  "database_path": "/www/wwwroot/zg_xhs_api/data/auction_lots.sqlite3",
   "items": [
     {
       "lot_id": "34599005",
+      "lot_number": "221",
       "title": "一款1960年代的柚木贴面斯堪的纳维亚风格餐桌...",
       "url": "https://drouot.com/zh/l/34599005-kuan-1960nian-dai-de-you-mu-tie-mian-si-kan-de-na-wei-ya",
       "image_link": "https://cdn.drouot.com/d/image/lot?size=ftall&path=...",
       "sale_status": "live",
       "sale_time": "8月14日 | 下午02:00",
       "estimate": "€400 - 600",
+      "currency": "EUR",
+      "low_estimate": 400,
+      "high_estimate": 600,
+      "sale_timestamp": 1786708800,
+      "sale_type": "LIVE",
+      "sale_id": 184022,
+      "auctioneer_id": 970,
+      "page": 1,
+      "position": 1,
       "raw_text": "live 8月14日 | 下午02:00 ..."
     }
   ]
@@ -258,6 +288,10 @@ Cloudflare fallback 只在 `render=auto` 或 `render=always` 时启用；`render
 ```env
 CORS_ALLOW_ORIGINS=*
 SCRAPER_DATA_DIR=./data
+AUCTION_DB_PATH=
+DROUOT_API_TIMEOUT=60
+DROUOT_API_RETRIES=4
+DROUOT_API_RETRY_DELAY=2
 LOG_LEVEL=INFO
 SUPERBED_UPLOAD_URL=https://api.superbed.cc/upload
 SUPERBED_TOKEN=你的SuperBed token
@@ -317,6 +351,10 @@ XHS_POST_API_KEY=xhs_post
 - `SCRAPE_CONCURRENCY`：同时执行完整抓取流程的请求数，默认 `3`
 - `BATCH_CONCURRENCY`：单个批量请求内同时处理的商品链接数，默认 `2`
 - `RENDER_CONCURRENCY`：同时启动 Playwright 浏览器渲染的请求数，默认 `2`
+- `AUCTION_DB_PATH`：拍卖列表 SQLite 数据库路径，默认 `SCRAPER_DATA_DIR/auction_lots.sqlite3`
+- `DROUOT_API_TIMEOUT`：Drouot API 单页请求超时秒数，默认 `60`
+- `DROUOT_API_RETRIES`：Drouot API 单页失败重试次数，默认 `4`
+- `DROUOT_API_RETRY_DELAY`：Drouot API 重试递增等待秒数，默认 `2`
 - `CF_BYPASS_ENABLED`：是否在 Cloudflare 验证页启用授权浏览器 fallback，默认 `true`
 - `CF_BYPASS_CONCURRENCY`：同时运行 Cloudflare fallback 浏览器的数量，默认 `1`
 - `CF_BYPASS_RETRIES`：验证按钮点击/等待次数，默认 `8`

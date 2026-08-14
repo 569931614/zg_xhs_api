@@ -51,16 +51,28 @@ class AuctionListRequest(BaseModel):
     url: HttpUrl
     render: Literal["auto", "always", "never"] = "auto"
     max_items: int = Field(default=50, ge=1, le=100)
+    max_pages: int = Field(default=0, ge=0, le=500)
+    save_to_db: bool = True
 
 
 class AuctionLotItem(BaseModel):
     lot_id: str = ""
+    lot_number: str = ""
     title: str = ""
     url: str
     image_link: str = ""
     sale_status: str = ""
     sale_time: str = ""
     estimate: str = ""
+    currency: str = ""
+    low_estimate: float | int | None = None
+    high_estimate: float | int | None = None
+    sale_timestamp: int = 0
+    sale_type: str = ""
+    sale_id: int | None = None
+    auctioneer_id: int | None = None
+    page: int = 0
+    position: int = 0
     raw_text: str = ""
 
 
@@ -69,6 +81,9 @@ class AuctionListResponse(BaseModel):
     fetched_url: str
     title: str = ""
     total_count: int | None = None
+    pages_fetched: int = 0
+    saved_count: int = 0
+    database_path: str = ""
     items: list[AuctionLotItem] = Field(default_factory=list)
 
 

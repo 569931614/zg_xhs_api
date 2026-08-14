@@ -537,15 +537,23 @@ def scrape_auction_list(payload: AuctionListRequest) -> AuctionListResponse:
     started = time.monotonic()
     url = strip_tracking_query(str(payload.url))
     logger.info(
-        "api event=received request_id=%s endpoint=/api/auction/list render=%s max_items=%d url=%s",
+        "api event=received request_id=%s endpoint=/api/auction/list render=%s max_items=%d max_pages=%d save_to_db=%s url=%s",
         api_request_id,
         payload.render,
         payload.max_items,
+        payload.max_pages,
+        payload.save_to_db,
         url_log_value(url),
     )
     validate_public_url(url)
     try:
-        result = extract_auction_list(url, payload.render, payload.max_items)
+        result = extract_auction_list(
+            url,
+            payload.render,
+            payload.max_items,
+            max_pages=payload.max_pages,
+            save_to_db=payload.save_to_db,
+        )
     except AuctionListError as exc:
         logger.exception(
             "api event=failed request_id=%s endpoint=/api/auction/list url=%s elapsed=%.2fs",
@@ -564,9 +572,11 @@ def scrape_auction_list(payload: AuctionListRequest) -> AuctionListResponse:
         raise HTTPException(status_code=502, detail=f"Failed to scrape auction list: {exc}") from exc
 
     logger.info(
-        "api event=done request_id=%s endpoint=/api/auction/list items=%d elapsed=%.2fs",
+        "api event=done request_id=%s endpoint=/api/auction/list items=%d pages=%d saved=%d elapsed=%.2fs",
         api_request_id,
         len(result.get("items") or []),
+        result.get("pages_fetched", 0),
+        result.get("saved_count", 0),
         time.monotonic() - started,
     )
     return AuctionListResponse(**result)
