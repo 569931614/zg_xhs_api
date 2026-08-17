@@ -51,6 +51,8 @@ EARLY_GALLERY_FILTER_DOMAINS = {"pauletteintstad.com"}
 PRIMARY_GALLERY_ONLY_DOMAINS = {"ancien.co.uk", "pauletteintstad.com"}
 HASH_PROJECT_ROUTE_DOMAINS = {"sauceldn.com"}
 ATKRIS_PRODUCT_IMAGE_DOMAINS = {"atkris.com"}
+FUNDAMENTE_DOMAINS = {"fundamente.nl"}
+SITONVINTAGE_DOMAINS = {"sitonvintage.com"}
 KNOWN_CURRENCY_CODES = {
     "AUD",
     "CAD",
@@ -736,10 +738,32 @@ def extract_atkris_product_image_urls(soup: BeautifulSoup, base_url: str) -> lis
     return list(dict.fromkeys(urls))
 
 
+def extract_fundamente_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for img in soup.select(".gallery--collection img.gallery--grid__img"):
+        image_url = image_url_from_img_tag(img, base_url)
+        if image_url:
+            urls.append(image_url)
+    return list(dict.fromkeys(urls))
+
+
+def extract_sitonvintage_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for link in soup.select(".elementor-gallery__container a.e-gallery-item[href]"):
+        href = clean_text(link.get("href"))
+        if re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", href, re.I):
+            urls.append(normalize_url(href, base_url))
+    return list(dict.fromkeys(urls))
+
+
 def extract_domain_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
     hostname = normalized_hostname(base_url)
     if hostname in ATKRIS_PRODUCT_IMAGE_DOMAINS:
         return extract_atkris_product_image_urls(soup, base_url)
+    if hostname in FUNDAMENTE_DOMAINS:
+        return extract_fundamente_product_image_urls(soup, base_url)
+    if hostname in SITONVINTAGE_DOMAINS:
+        return extract_sitonvintage_product_image_urls(soup, base_url)
     return []
 
 
@@ -1447,6 +1471,98 @@ def extract_heading_text_block(
         info["dimensions"] = str(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
+
+
+def extract_fundamente_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    block = soup.select_one(".gallery--collection .gallery--text")
+    if block is None:
+        return {}
+
+    heading = block.find(["h1", "h2", "h3"])
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+
+    description_lines = []
+    article = block.find("article")
+    if article is not None:
+        for element in article.find_all(["p", "li"], recursive=False):
+            text = clean_text(element.get_text(" "))
+            if text:
+                description_lines.append(text)
+    description = clean_text(" ".join(description_lines))
+
+    details: dict[str, Any] = {}
+    price = ""
+    meta_block = block.select_one(".meta-block")
+    meta_lines = [
+        clean_text(line)
+        for line in (meta_block.get_text("\n").splitlines() if meta_block else [])
+        if clean_text(line)
+    ]
+    for index, line in enumerate(meta_lines):
+        if re.match(r"^Dimensions?\s*:?\s*$", line, re.I) and index + 1 < len(meta_lines):
+            dimensions = clean_dimension_text(meta_lines[index + 1])
+            if dimensions:
+                details["dimensions"] = dimensions
+        elif re.match(r"^Dimensions?\s*[:：]\s*(.+)$", line, re.I):
+            match = re.match(r"^Dimensions?\s*[:：]\s*(.+)$", line, re.I)
+            if match:
+                dimensions = clean_dimension_text(match.group(1))
+                if dimensions:
+                    details["dimensions"] = dimensions
+        elif re.match(r"^Price\s*:?\s*$", line, re.I) and index + 1 < len(meta_lines):
+            price = clean_price_text(meta_lines[index + 1])
+        elif re.match(r"^Price\s*[:：]\s*(.+)$", line, re.I):
+            match = re.match(r"^Price\s*[:：]\s*(.+)$", line, re.I)
+            if match:
+                price = clean_price_text(match.group(1))
+
+    info: dict[str, Any] = {"source": "fundamente-product-page", "url": base_url}
+    if name:
+        info["name"] = name
+    if description:
+        info["description"] = description
+    if price:
+        info["price"] = price
+    if details:
+        info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
+    add_synthesized_dimensions(info)
+    return info
+
+
+def extract_sitonvintage_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    heading = soup.select_one("h1.product_title") or soup.find("h1")
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    if not name:
+        return {}
+
+    info: dict[str, Any] = {
+        "source": "sitonvintage-product-page",
+        "url": base_url,
+        "name": name,
+    }
+    lines = [clean_text(line) for line in (soup.body.get_text("\n").splitlines() if soup.body else [])]
+    lines = [line for line in lines if line]
+    for index, line in enumerate(lines):
+        if re.match(r"^Price\s*:?\s*$", line, re.I) and index + 1 < len(lines):
+            value = clean_text(lines[index + 1])
+            if value:
+                if re.search(r"\bsold\b", value, re.I):
+                    info["availability"] = "Sold"
+                elif line_looks_like_price(value):
+                    info["price"] = clean_price_text(value)
+            break
+    return info
+
+
+def extract_domain_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    hostname = normalized_hostname(base_url)
+    if hostname in FUNDAMENTE_DOMAINS:
+        return extract_fundamente_product_info(soup, base_url)
+    if hostname in SITONVINTAGE_DOMAINS:
+        return extract_sitonvintage_product_info(soup, base_url)
+    return {}
 
 
 def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: str = "") -> dict[str, Any]:
@@ -2441,6 +2557,7 @@ def extract(
     analytics_info = extract_analytics_product_info(soup)
     nextjs_info = extract_nextjs_product_info(soup)
     auctionet_info = extract_auctionet_page_data(soup)
+    domain_info = extract_domain_product_info(soup, final_url)
     domain_product_images = extract_domain_product_image_urls(soup, final_url)
 
     product_info = {}
@@ -2448,6 +2565,7 @@ def extract(
         product_info = merge_product_info(product_info, info)
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
     product_info = merge_product_info(dom_info, product_info)
+    product_info = merge_product_info(domain_info, product_info)
     product_info = merge_product_info(analytics_info, product_info)
     product_info = merge_product_info(nextjs_info, product_info)
     product_info = merge_product_info(auctionet_info, product_info)
