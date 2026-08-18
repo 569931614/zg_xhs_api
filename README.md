@@ -309,6 +309,7 @@ CF_BYPASS_WAIT=8
 CF_BYPASS_PAGE_TIMEOUT=60
 CF_BYPASS_HEADLESS=false
 CF_BROWSER_PATH=
+CF_CHROMIUM_ARGS=
 CF_TURNSTILE_EXTENSION_PATH=
 CF_UA_EXTENSION_PATH=
 XHS_IMAGE_PROCESS_CONCURRENCY=20
@@ -362,6 +363,7 @@ XHS_POST_API_KEY=xhs_post
 - `CF_BYPASS_PAGE_TIMEOUT`：Cloudflare fallback 单次页面加载超时秒数，默认 `60`
 - `CF_BYPASS_HEADLESS`：Cloudflare fallback 是否无头运行，默认 `false`
 - `CF_BROWSER_PATH`：Chrome/Chromium/Edge 可执行文件路径，自动识别失败时填写
+- `CF_CHROMIUM_ARGS`：Cloudflare fallback 额外 Chromium 启动参数。Linux 下会自动追加 `--disable-dev-shm-usage`，root 用户会自动追加 `--no-sandbox`
 - `IMAGE_UPLOAD_CONCURRENCY`：单个请求内并发上传图片数，默认 `6`
 - `IMAGE_UPLOAD_TOTAL_CONCURRENCY`：全服务同时上传图片数，默认 `12`
 - `XHS_IMAGE_PROCESS_CONCURRENCY`：小红书图片下载/裁剪/加 logo 的并发数，默认 `20`
@@ -403,12 +405,18 @@ playwright install chromium
 google-chrome --version || chromium --version
 ```
 
-无桌面环境时建议使用 Xvfb 或将 `CF_BYPASS_HEADLESS=true` 后测试目标站点是否能通过验证。部分 Cloudflare 验证在无头模式下可能仍会失败。
+无桌面环境时建议使用 Xvfb 启动服务，或将 `CF_BYPASS_HEADLESS=true` 后测试目标站点是否能通过验证。部分 Cloudflare 验证在无头模式下可能仍会失败。
 
 用 PM2 启动：
 
 ```bash
 pm2 start .venv/bin/uvicorn --name zg-xhs-api --interpreter none -- app.main:app --host 0.0.0.0 --port 8000
+```
+
+如果目标站点的 Cloudflare 验证无法在 headless 模式通过，用 Xvfb 启动：
+
+```bash
+pm2 start /usr/bin/xvfb-run --name zg-xhs-api --interpreter none -- -a .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 修改 `.env` 后重启：

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -138,6 +139,19 @@ def is_cloudflare_blocked(title: str, body_text: str, html: str = "") -> bool:
     return any(marker in haystack for marker in BLOCKED_MARKERS)
 
 
+def playwright_chromium_candidates() -> list[str]:
+    candidates: list[str] = []
+    cache_roots = []
+    if os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip():
+        cache_roots.append(Path(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "")).expanduser())
+    cache_roots.append(Path.home() / ".cache" / "ms-playwright")
+    for cache_root in cache_roots:
+        if not str(cache_root) or not cache_root.exists():
+            continue
+        candidates.extend(str(path) for path in cache_root.glob("chromium-*/chrome-linux/chrome"))
+    return candidates
+
+
 def browser_candidates() -> list[str | None]:
     system = platform.system()
     if system == "Windows":
@@ -161,7 +175,7 @@ def browser_candidates() -> list[str | None]:
             "/usr/bin/chromium-browser",
             "/snap/bin/chromium",
         ]
-    return [os.getenv("CF_BROWSER_PATH"), os.getenv("CHROME_PATH"), *paths]
+    return [os.getenv("CF_BROWSER_PATH"), os.getenv("CHROME_PATH"), *paths, *playwright_chromium_candidates()]
 
 
 def resolve_browser_path() -> str:
@@ -179,6 +193,20 @@ def extension_paths() -> tuple[str, str]:
     if missing:
         raise CloudflareBypassError(f"Missing Cloudflare browser extension(s): {', '.join(missing)}")
     return str(turnstile), str(ua_patch)
+
+
+def chromium_runtime_args() -> list[str]:
+    args: list[str] = []
+    if platform.system() == "Linux":
+        args.append("--disable-dev-shm-usage")
+        if getattr(os, "geteuid", lambda: -1)() == 0:
+            args.append("--no-sandbox")
+
+    extra_args = os.getenv("CF_CHROMIUM_ARGS", "").strip()
+    if extra_args:
+        args.extend(shlex.split(extra_args))
+
+    return list(dict.fromkeys(args))
 
 
 def build_chromium_options(browser_path: str, headless: bool) -> Any:
@@ -199,6 +227,8 @@ def build_chromium_options(browser_path: str, headless: bool) -> Any:
     options.set_argument("--disable-background-mode")
     options.set_argument("--deny-permission-prompts")
     options.set_argument("--window-size=1280,900")
+    for arg in chromium_runtime_args():
+        options.set_argument(arg)
     options.add_extension(turnstile_patch)
     options.add_extension(ua_patch)
     return options

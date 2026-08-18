@@ -1027,6 +1027,7 @@ def normalize_detail_label(label: str) -> str:
         "made in": "Place of Origin",
         "date of manufacture": "Date of Manufacture",
         "year of manufacture": "Date of Manufacture",
+        "materials": "Material",
         "materials and techniques": "Materials and Techniques",
         "designed by": "Designer",
         "produced by": "Manufacturer",
@@ -1143,6 +1144,20 @@ def line_looks_like_dimensions(line: str) -> bool:
             re.I,
         )
         or re.search(r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m)\s*\([hwdbl]\)", line, re.I)
+    )
+
+
+def labeled_value_looks_like_dimensions(value: str) -> bool:
+    value = clean_dimension_text(value)
+    if line_looks_like_dimensions(value):
+        return True
+    return bool(
+        re.search(
+            r"^\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?"
+            r"(?:\s*(?:x|×)\s*\d+(?:[.,]\d+)?)?\s*$",
+            value,
+            re.I,
+        )
     )
 
 
@@ -1711,12 +1726,14 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     ]
     details: dict[str, Any] = {}
 
-    def add_detail(label: Any, value: Any) -> None:
+    def add_detail(label: Any, value: Any, override: bool = False) -> None:
         detail_key = normalize_detail_label(clean_detail_key(label))
         detail_value = clean_detail_value(value)
         if detail_key == "dimensions":
             detail_value = clean_dimension_text(detail_value)
-            if str(detail_value).lower() in {"soon", "coming soon", "n/a", "na", "none", "-"}:
+            if str(detail_value).lower() in {"soon", "coming soon", "n/a", "na", "none", "-", "stock", "in stock"}:
+                return
+            if not labeled_value_looks_like_dimensions(str(detail_value)):
                 return
         if (
             not detail_key
@@ -1727,15 +1744,29 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
             return
         if len(detail_key) > 80 or len(str(detail_value)) > 1000:
             return
-        details.setdefault(detail_key, detail_value)
+        if override:
+            details[detail_key] = detail_value
+        else:
+            details.setdefault(detail_key, detail_value)
+
+    def is_inside_non_product_detail_block(element: Any) -> bool:
+        attrs = " ".join(
+            clean_text(" ".join(parent.get("class", [])) + " " + str(parent.get("id") or ""))
+            for parent in element.parents
+        )
+        return bool(re.search(r"\b(filter|sidebar|navigation|menu|footer|header|breadcrumbs?)\b", attrs, re.I))
 
     for row in soup.find_all("tr"):
+        if is_inside_non_product_detail_block(row):
+            continue
         cells = [clean_text(cell.get_text(" ")) for cell in row.find_all(["th", "td"])]
         cells = [cell for cell in cells if cell]
         if len(cells) >= 2:
             add_detail(cells[0], " ".join(cells[1:]))
 
     for definition_list in soup.find_all("dl"):
+        if is_inside_non_product_detail_block(definition_list):
+            continue
         terms = definition_list.find_all("dt")
         for term in terms:
             values = []
@@ -1746,6 +1777,27 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
                 sibling = sibling.find_next_sibling()
             if values:
                 add_detail(term.get_text(" "), " ".join(values))
+
+    for tab_container in soup.select(".product-tabs"):
+        value_by_class: dict[str, str] = {}
+        for value_node in tab_container.select(".infotext"):
+            value_classes = [str(item) for item in value_node.get("class", [])]
+            value = clean_text(value_node.get_text(" "))
+            if not value:
+                continue
+            for class_name in value_classes:
+                if class_name not in {"infotext", "hide", "active"}:
+                    value_by_class[class_name] = value
+
+        for label_node in tab_container.select("ul li"):
+            label = clean_text(label_node.get_text(" "))
+            if not label:
+                continue
+            for class_name in label_node.get("class", []):
+                value = value_by_class.get(str(class_name))
+                if value:
+                    add_detail(label, value, override=True)
+                    break
 
     for line in lines:
         if re.match(
