@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import logging
 import mimetypes
 import os
@@ -14,6 +15,13 @@ from urllib.parse import urlencode, urlparse, urlunparse
 
 import requests
 from PIL import Image, ImageOps
+
+from app.services.cloudflare import (
+    CloudflareBypasser,
+    build_chromium_options,
+    cloudflare_semaphore,
+    resolve_browser_path,
+)
 
 
 USER_AGENT = (
@@ -46,6 +54,13 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
     except ValueError:
         return default
     return max(minimum, value)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "").strip().lower()
+    if not raw_value:
+        return default
+    return raw_value in {"1", "true", "yes", "on"}
 
 
 def extension_from_response(url: str, content_type: str) -> str:
@@ -119,7 +134,19 @@ def extract_superbed_url(payload: Any) -> str:
 def download_image(url: str, target_dir: Path, session: requests.Session) -> tuple[Path, int]:
     target_dir.mkdir(parents=True, exist_ok=True)
     response = session.get(url, timeout=45, stream=True)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response.close()
+        status_code = exc.response.status_code if exc.response is not None else 0
+        if status_code in {401, 403, 429} and env_bool("IMAGE_DOWNLOAD_BROWSER_FALLBACK", True):
+            logger.warning(
+                "image_upload stage=download_browser_fallback_start source_host=%s status=%s",
+                urlparse(url).netloc,
+                status_code,
+            )
+            return download_image_with_browser(url, target_dir)
+        raise
 
     max_bytes = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(DEFAULT_MAX_IMAGE_BYTES)))
     content_type = response.headers.get("content-type", "")
@@ -137,6 +164,87 @@ def download_image(url: str, target_dir: Path, session: requests.Session) -> tup
                 raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
             file.write(chunk)
     return target_path, total
+
+
+def download_image_with_browser(url: str, target_dir: Path) -> tuple[Path, int]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from DrissionPage import ChromiumPage
+    except ImportError as exc:
+        raise ImageHostingError("DrissionPage is not installed for browser image download fallback") from exc
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ImageHostingError(f"Cannot browser-download invalid image URL: {url}")
+
+    browser_path = resolve_browser_path()
+    headless = env_bool("CF_BYPASS_HEADLESS", False)
+    retries = env_int("CF_BYPASS_RETRIES", 8)
+    page_timeout = env_int("CF_BYPASS_PAGE_TIMEOUT", 60)
+    max_bytes = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(DEFAULT_MAX_IMAGE_BYTES)))
+    started = time.monotonic()
+
+    with cloudflare_semaphore():
+        driver = ChromiumPage(addr_or_opts=build_chromium_options(browser_path, headless))
+        try:
+            ok = driver.get(url, timeout=page_timeout)
+            if ok is False:
+                raise ImageHostingError(f"Browser image load timed out after {page_timeout}s: {url}")
+            CloudflareBypasser(driver, max_retries=retries).bypass()
+
+            payload = driver.run_cdp(
+                "Runtime.evaluate",
+                expression="""
+                    (async () => {
+                        try {
+                            const image = document.images && document.images[0];
+                            const target = image ? (image.currentSrc || image.src) : location.href;
+                            const response = await fetch(target, {credentials: 'include', cache: 'reload'});
+                            const contentType = response.headers.get('content-type') || '';
+                            if (!response.ok) {
+                                return {ok: false, status: response.status, statusText: response.statusText, contentType, target};
+                            }
+                            const buffer = await response.arrayBuffer();
+                            const bytes = new Uint8Array(buffer);
+                            let binary = '';
+                            const chunkSize = 0x8000;
+                            for (let i = 0; i < bytes.length; i += chunkSize) {
+                                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                            }
+                            return {ok: true, status: response.status, contentType, data: btoa(binary), bytes: bytes.length, target};
+                        } catch (error) {
+                            return {ok: false, error: String(error), name: error && error.name, target: location.href};
+                        }
+                    })()
+                """,
+                awaitPromise=True,
+                returnByValue=True,
+            )
+        finally:
+            driver.quit()
+
+    result = payload.get("result", {}).get("value") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        raise ImageHostingError(f"Browser image download returned unexpected payload: {payload}")
+    if not result.get("ok"):
+        raise ImageHostingError(f"Browser image download failed: {result}")
+
+    data = base64.b64decode(str(result.get("data") or ""))
+    if len(data) > max_bytes:
+        raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
+
+    content_type = str(result.get("contentType") or "")
+    ext = extension_from_response(url, content_type)
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    target_path = target_dir / f"{digest}{ext}"
+    target_path.write_bytes(data)
+    logger.warning(
+        "image_upload stage=download_browser_fallback_done source_host=%s bytes=%d elapsed=%.2fs",
+        parsed.netloc,
+        len(data),
+        time.monotonic() - started,
+    )
+    return target_path, len(data)
 
 
 def optimize_image_for_upload(path: Path, original_bytes: int) -> tuple[Path, int]:

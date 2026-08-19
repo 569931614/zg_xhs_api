@@ -606,7 +606,7 @@ def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse | XH
                 public_result, job_id, job_dir = run_scrape_url(
                     url,
                     payload,
-                    upload_images=False,
+                    upload_images=True,
                     request_id_value=item_request_id,
                 )
                 result = create_xhs_note(public_result, job_id, job_dir, request_id_value=item_request_id)
@@ -656,7 +656,7 @@ def create_xhs_product_note(payload: XHSCreateRequest) -> XHSCreateResponse | XH
         return XHSCreateBatchResponse(results=results)
 
     started = time.monotonic()
-    public_result, job_id, job_dir = run_scrape(payload, upload_images=False, request_id_value=api_request_id)
+    public_result, job_id, job_dir = run_scrape(payload, upload_images=True, request_id_value=api_request_id)
     try:
         result = create_xhs_note(public_result, job_id, job_dir, request_id_value=api_request_id)
     except XHSPipelineError as exc:

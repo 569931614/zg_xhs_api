@@ -2647,7 +2647,7 @@ def extract(
         candidates = prefer_early_product_gallery(candidates)
         candidates = prefer_current_product_group(candidates, product_info.get("name", ""))
         candidates = prefer_page_path_images(candidates, final_url)
-        candidates = filter_domain_image_candidates(candidates, final_url)
+    candidates = filter_domain_image_candidates(candidates, final_url)
     selected = [
         {
             "url": c.url,
