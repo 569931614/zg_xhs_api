@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import json
 import logging
 import mimetypes
 import os
@@ -36,6 +37,7 @@ DEFAULT_OPTIMIZE_MIN_BYTES = 1500 * 1024
 DEFAULT_OPTIMIZE_MAX_DIMENSION = 1600
 DEFAULT_IMAGE_UPLOAD_CONCURRENCY = 6
 DEFAULT_IMAGE_UPLOAD_TOTAL_CONCURRENCY = 12
+DEFAULT_IMAGE_BROWSER_BATCH_HOSTS = "goldwoodbyboris.com"
 logger = logging.getLogger("uvicorn.error")
 
 _upload_semaphore: threading.BoundedSemaphore | None = None
@@ -63,6 +65,40 @@ def env_bool(name: str, default: bool) -> bool:
     return raw_value in {"1", "true", "yes", "on"}
 
 
+def browser_batch_hosts() -> set[str]:
+    raw_value = os.getenv("IMAGE_BROWSER_BATCH_HOSTS", DEFAULT_IMAGE_BROWSER_BATCH_HOSTS).strip()
+    return {host.strip().lower() for host in raw_value.split(",") if host.strip()}
+
+
+def hostname_matches(hostname: str, configured_host: str) -> bool:
+    hostname = hostname.lower().strip(".")
+    configured_host = configured_host.lower().strip(".")
+    return hostname == configured_host or hostname.endswith(f".{configured_host}")
+
+
+def should_use_browser_batch_download(images: list[dict[str, Any]]) -> bool:
+    if not env_bool("IMAGE_DOWNLOAD_BROWSER_FALLBACK", True):
+        return False
+    hosts = browser_batch_hosts()
+    if not hosts:
+        return False
+
+    source_hosts = []
+    for image in images:
+        source_url = str(image.get("url") or "")
+        if not source_url:
+            return False
+        hostname = urlparse(source_url).hostname or ""
+        if not hostname:
+            return False
+        source_hosts.append(hostname)
+
+    return bool(source_hosts) and all(
+        any(hostname_matches(hostname, configured_host) for configured_host in hosts)
+        for hostname in source_hosts
+    )
+
+
 def extension_from_response(url: str, content_type: str) -> str:
     content_type = content_type.split(";", 1)[0].strip().lower()
     guessed = mimetypes.guess_extension(content_type) if content_type else ""
@@ -74,6 +110,22 @@ def extension_from_response(url: str, content_type: str) -> str:
     if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}:
         return suffix
     return ".jpg"
+
+
+def local_image_path(url: str, target_dir: Path, content_type: str = "") -> Path:
+    ext = extension_from_response(url, content_type)
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    return target_dir / f"{digest}{ext}"
+
+
+def write_image_bytes(url: str, target_dir: Path, content_type: str, data: bytes) -> tuple[Path, int]:
+    max_bytes = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(DEFAULT_MAX_IMAGE_BYTES)))
+    if len(data) > max_bytes:
+        raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = local_image_path(url, target_dir, content_type)
+    target_path.write_bytes(data)
+    return target_path, len(data)
 
 
 def superbed_upload_url() -> str:
@@ -150,9 +202,7 @@ def download_image(url: str, target_dir: Path, session: requests.Session) -> tup
 
     max_bytes = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(DEFAULT_MAX_IMAGE_BYTES)))
     content_type = response.headers.get("content-type", "")
-    ext = extension_from_response(url, content_type)
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-    target_path = target_dir / f"{digest}{ext}"
+    target_path = local_image_path(url, target_dir, content_type)
 
     total = 0
     with target_path.open("wb") as file:
@@ -230,21 +280,112 @@ def download_image_with_browser(url: str, target_dir: Path) -> tuple[Path, int]:
         raise ImageHostingError(f"Browser image download failed: {result}")
 
     data = base64.b64decode(str(result.get("data") or ""))
-    if len(data) > max_bytes:
-        raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
-
     content_type = str(result.get("contentType") or "")
-    ext = extension_from_response(url, content_type)
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-    target_path = target_dir / f"{digest}{ext}"
-    target_path.write_bytes(data)
+    target_path, byte_count = write_image_bytes(url, target_dir, content_type, data)
     logger.warning(
         "image_upload stage=download_browser_fallback_done source_host=%s bytes=%d elapsed=%.2fs",
         parsed.netloc,
-        len(data),
+        byte_count,
         time.monotonic() - started,
     )
-    return target_path, len(data)
+    return target_path, byte_count
+
+
+def browser_fetch_image(driver: Any, url: str, max_bytes: int) -> tuple[bytes, str, str]:
+    payload = driver.run_cdp(
+        "Runtime.evaluate",
+        expression=f"""
+            (async () => {{
+                const target = {json.dumps(url)};
+                const maxBytes = {int(max_bytes)};
+                try {{
+                    const response = await fetch(target, {{credentials: 'include', cache: 'reload'}});
+                    const contentType = response.headers.get('content-type') || '';
+                    if (!response.ok) {{
+                        return {{ok: false, status: response.status, statusText: response.statusText, contentType, target}};
+                    }}
+                    const buffer = await response.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    if (bytes.length > maxBytes) {{
+                        return {{ok: false, error: `Image exceeds max download size: ${{maxBytes}} bytes`, bytes: bytes.length, target}};
+                    }}
+                    let binary = '';
+                    const chunkSize = 0x8000;
+                    for (let i = 0; i < bytes.length; i += chunkSize) {{
+                        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                    }}
+                    return {{ok: true, status: response.status, contentType, data: btoa(binary), bytes: bytes.length, target}};
+                }} catch (error) {{
+                    return {{ok: false, error: String(error), name: error && error.name, target}};
+                }}
+            }})()
+        """,
+        awaitPromise=True,
+        returnByValue=True,
+    )
+    result = payload.get("result", {}).get("value") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        raise ImageHostingError(f"Browser image download returned unexpected payload: {payload}")
+    if not result.get("ok"):
+        raise ImageHostingError(f"Browser image download failed: {result}")
+    data = base64.b64decode(str(result.get("data") or ""))
+    return data, str(result.get("contentType") or ""), str(result.get("target") or url)
+
+
+def download_images_with_shared_browser(urls: list[str], target_dir: Path) -> dict[int, tuple[Path, int]]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if not urls:
+        return {}
+    try:
+        from DrissionPage import ChromiumPage
+    except ImportError as exc:
+        raise ImageHostingError("DrissionPage is not installed for browser image download fallback") from exc
+
+    first_url = urls[0]
+    browser_path = resolve_browser_path()
+    headless = env_bool("CF_BYPASS_HEADLESS", False)
+    retries = env_int("CF_BYPASS_RETRIES", 8)
+    page_timeout = env_int("CF_BYPASS_PAGE_TIMEOUT", 60)
+    max_bytes = int(os.getenv("IMAGE_DOWNLOAD_MAX_BYTES", str(DEFAULT_MAX_IMAGE_BYTES)))
+    parsed = urlparse(first_url)
+    started = time.monotonic()
+
+    logger.warning(
+        "image_upload_batch stage=browser_batch_download_start source_host=%s images=%d",
+        parsed.netloc,
+        len(urls),
+    )
+    downloaded: dict[int, tuple[Path, int]] = {}
+    with cloudflare_semaphore():
+        driver = ChromiumPage(addr_or_opts=build_chromium_options(browser_path, headless))
+        try:
+            ok = driver.get(first_url, timeout=page_timeout)
+            if ok is False:
+                raise ImageHostingError(f"Browser image load timed out after {page_timeout}s: {first_url}")
+            CloudflareBypasser(driver, max_retries=retries).bypass()
+            for index, url in enumerate(urls):
+                image_started = time.monotonic()
+                data, content_type, target = browser_fetch_image(driver, url, max_bytes)
+                path, byte_count = write_image_bytes(url, target_dir, content_type, data)
+                downloaded[index] = (path, byte_count)
+                logger.warning(
+                    "image_upload stage=download_browser_batch_done source_host=%s index=%d bytes=%d target=%s elapsed=%.2fs",
+                    urlparse(url).netloc,
+                    index,
+                    byte_count,
+                    target,
+                    time.monotonic() - image_started,
+                )
+        finally:
+            driver.quit()
+
+    logger.warning(
+        "image_upload_batch stage=browser_batch_download_done source_host=%s images=%d elapsed=%.2fs",
+        parsed.netloc,
+        len(downloaded),
+        time.monotonic() - started,
+    )
+    return downloaded
 
 
 def optimize_image_for_upload(path: Path, original_bytes: int) -> tuple[Path, int]:
@@ -376,6 +517,114 @@ def upload_one_image(
     return index, item
 
 
+def upload_downloaded_image(
+    index: int,
+    image: dict[str, Any],
+    local_path: Path,
+    byte_count: int,
+    request_id_value: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    started = time.monotonic()
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+    item = dict(image)
+    try:
+        logger.info(
+            "image_upload event=upload_started request_id=%s index=%d source_host=%s",
+            request_id_value,
+            index,
+            urlparse(str(item.get("url") or "")).netloc,
+        )
+        with upload_semaphore():
+            upload_path, upload_byte_count = optimize_image_for_upload(local_path, byte_count)
+            hosted_url = upload_to_superbed(upload_path, session)
+        item["hosted_url"] = hosted_url
+        item["filename"] = upload_path.name
+        item["bytes"] = byte_count
+        item["upload_bytes"] = upload_byte_count
+        logger.info(
+            "image_upload event=done request_id=%s index=%d bytes=%d upload_bytes=%d elapsed=%.2fs",
+            request_id_value,
+            index,
+            byte_count,
+            upload_byte_count,
+            time.monotonic() - started,
+        )
+    except Exception as exc:
+        item["hosted_url"] = item.get("hosted_url") or item.get("url") or ""
+        item["upload_error"] = str(exc)
+        logger.exception(
+            "image_upload event=failed request_id=%s index=%d source_host=%s elapsed=%.2fs",
+            request_id_value,
+            index,
+            urlparse(str(item.get("url") or "")).netloc,
+            time.monotonic() - started,
+        )
+    return index, item
+
+
+def upload_images_to_superbed_with_shared_browser(
+    images: list[dict[str, Any]],
+    temp_dir: Path,
+    request_id_value: str | None = None,
+) -> list[dict[str, Any]]:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any] | None] = [None] * len(images)
+    urls = [str(image.get("url") or "") for image in images]
+    started = time.monotonic()
+    logger.info(
+        "image_upload_batch event=browser_batch_started request_id=%s images=%d hosts=%s",
+        request_id_value,
+        len(images),
+        ",".join(sorted(browser_batch_hosts())),
+    )
+
+    try:
+        downloaded = download_images_with_shared_browser(urls, temp_dir)
+    except Exception:
+        logger.exception(
+            "image_upload_batch event=browser_batch_download_failed request_id=%s images=%d elapsed=%.2fs",
+            request_id_value,
+            len(images),
+            time.monotonic() - started,
+        )
+        downloaded = {}
+
+    for index, image in enumerate(images):
+        if index not in downloaded:
+            item = dict(image)
+            item["hosted_url"] = item.get("hosted_url") or item.get("url") or ""
+            item["upload_error"] = "Shared browser image download failed"
+            results[index] = item
+
+    max_workers = min(image_upload_concurrency(), len(downloaded)) if downloaded else 0
+    if max_workers:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    upload_downloaded_image,
+                    index,
+                    images[index],
+                    local_path,
+                    byte_count,
+                    request_id_value,
+                )
+                for index, (local_path, byte_count) in downloaded.items()
+            ]
+            for future in as_completed(futures):
+                index, item = future.result()
+                results[index] = item
+
+    logger.info(
+        "image_upload_batch event=browser_batch_done request_id=%s images=%d uploaded=%d elapsed=%.2fs",
+        request_id_value,
+        len(images),
+        len(downloaded),
+        time.monotonic() - started,
+    )
+    return [item for item in results if item is not None]
+
+
 def upload_images_to_superbed(
     images: list[dict[str, Any]],
     temp_dir: Path,
@@ -386,6 +635,9 @@ def upload_images_to_superbed(
 
     try:
         temp_dir.mkdir(parents=True, exist_ok=True)
+        if should_use_browser_batch_download(images):
+            return upload_images_to_superbed_with_shared_browser(images, temp_dir, request_id_value)
+
         results: list[dict[str, Any] | None] = [None] * len(images)
         max_workers = min(image_upload_concurrency(), len(images))
         logger.info(
