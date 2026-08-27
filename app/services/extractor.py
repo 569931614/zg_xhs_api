@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import mimetypes
@@ -53,6 +54,23 @@ HASH_PROJECT_ROUTE_DOMAINS = {"sauceldn.com"}
 ATKRIS_PRODUCT_IMAGE_DOMAINS = {"atkris.com"}
 FUNDAMENTE_DOMAINS = {"fundamente.nl"}
 SITONVINTAGE_DOMAINS = {"sitonvintage.com"}
+MORENTZ_DOMAINS = {"morentz.com"}
+HGALLERY_DOMAINS = {"hgallery.com"}
+OLD_BOY_DOMAINS = {"old-boy.be"}
+AERA_LAB_DOMAINS = {"aera-lab.com"}
+QUITTENBAUM_DOMAINS = {"quittenbaum.de"}
+WOO_PRODUCT_TITLE_DOMAINS = {"lipefurniture.com"}
+SQUARESPACE_PRODUCT_DOMAINS = {
+    "altar.london",
+    "gallery-ornamentum.com",
+    "mccullyandcrane.com",
+    "fourquartershome.com",
+    "studioandstore.com",
+    "studiomantel.co.uk",
+    "sunlessantiques.com",
+    "postdesigncollective.com",
+    "thesouthlooploft.com",
+}
 KNOWN_CURRENCY_CODES = {
     "AUD",
     "CAD",
@@ -129,7 +147,7 @@ class ImageCandidate:
 def clean_text(value: Any) -> str:
     if value is None:
         return ""
-    text = re.sub(r"\s+", " ", str(value)).strip()
+    text = re.sub(r"\s+", " ", html.unescape(str(value))).strip()
     return text
 
 
@@ -203,7 +221,14 @@ def clean_dimension_text(value: Any) -> str:
     if not text:
         return ""
     text = re.split(r"\bPrice\s*[:：]", text, maxsplit=1, flags=re.I)[0]
-    return clean_text(text).strip(" .;-")
+    sentence_match = re.match(
+        r"^(.{0,220}\d.{0,220}?(?:cm|mm|in|inch|inches|m|″|”))\.\s+[A-ZÀ-Þ].*$",
+        text,
+        re.I,
+    )
+    if sentence_match:
+        text = sentence_match.group(1)
+    return clean_text(text).strip(" .;:-")
 
 
 def is_next_image_proxy_path(path: str) -> bool:
@@ -756,10 +781,51 @@ def extract_sitonvintage_product_image_urls(soup: BeautifulSoup, base_url: str) 
     return list(dict.fromkeys(urls))
 
 
+def extract_squarespace_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+    selectors = [
+        ".ProductItem-gallery-slides-item-image",
+        ".ProductItem-gallery-thumbnails-item-image",
+        ".product-gallery-slides-item-image",
+        ".product-gallery-thumbnails-item-image",
+    ]
+    for img in soup.select(", ".join(selectors)):
+        image_url = image_url_from_img_tag(img, base_url)
+        if image_url:
+            urls.append(image_url)
+    return list(dict.fromkeys(urls))
+
+
+def css_image_urls(css_text: str, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.finditer(r"url\((['\"]?)(.+?)\1\)", css_text, re.I):
+        raw_url = clean_text(match.group(2))
+        if not re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", raw_url, re.I):
+            continue
+        if NOISE_RE.search(raw_url):
+            continue
+        urls.append(normalize_url(raw_url, base_url))
+    return [url for url in urls if url]
+
+
+def extract_oldboy_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for tag in soup.find_all(style=True):
+        urls.extend(css_image_urls(str(tag.get("style") or ""), base_url))
+    for style in soup.find_all("style"):
+        urls.extend(css_image_urls(style.get_text() or "", base_url))
+    urls = [url for url in urls if "/wp-content/uploads/" in urlparse(url).path]
+    return list(dict.fromkeys(urls))
+
+
 def extract_domain_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
     hostname = normalized_hostname(base_url)
     if hostname in ATKRIS_PRODUCT_IMAGE_DOMAINS:
         return extract_atkris_product_image_urls(soup, base_url)
+    if hostname in SQUARESPACE_PRODUCT_DOMAINS:
+        return extract_squarespace_product_image_urls(soup, base_url)
+    if hostname in OLD_BOY_DOMAINS:
+        return extract_oldboy_product_image_urls(soup, base_url)
     if hostname in FUNDAMENTE_DOMAINS:
         return extract_fundamente_product_image_urls(soup, base_url)
     if hostname in SITONVINTAGE_DOMAINS:
@@ -854,14 +920,23 @@ def clean_product_title(title: str) -> str:
     suffix_noise = re.compile(
         r"(gallery|galleria|galerie|shop|store|collectibles|design|mobilia|"
         r"mdrn|modern living|atkris|objekt|béton brut|beton brut|daddy deco|"
-        r"paulette|approved|spazio leone|the oblist|envan rijn|ancien et jolie|sauce)",
+        r"paulette|approved|spazio leone|the oblist|envan rijn|ancien et jolie|sauce|"
+        r"altar|decollectible|t&t antiques|studio kiewiet|found studio|what'?s lost and found|"
+        r"ornamentum|four quarters home|studio \+ store|mantel|sunless|lorono|"
+        r"chwarehouse|lipe|oldboy|sitonvintage|möbel vom wiesinger)",
         re.I,
     )
     for separator in separators:
         parts = [part.strip() for part in title.split(separator) if part.strip()]
-        if len(parts) >= 2 and suffix_noise.search(parts[-1]):
+        product_word = re.search(
+            r"\b(table|chair|lamp|sofa|mirror|sideboard|sculpture|vase|rug|plate|desk|"
+            r"cabinet|sconce|stool|bench|object|chandelier|holder|pétala|petala)\b",
+            parts[-1] if parts else "",
+            re.I,
+        )
+        if len(parts) >= 2 and suffix_noise.search(parts[-1]) and not product_word:
             title = clean_text(separator.join(parts[:-1]))
-            break
+    title = re.sub(r"\s*\|\s*Los\s+\d+\s*$", "", title, flags=re.I).strip()
     title = re.sub(r"\s+[£$€]\s?[\d,.]+(?:\s*[A-Z]{3})?(?:\s*\|\s*Item\s*\(\d+\))?$", "", title, flags=re.I).strip()
     title = re.sub(r"\s*\|\s*Item\s*\(\d+\)\s*$", "", title, flags=re.I).strip()
     return title
@@ -1027,6 +1102,7 @@ def normalize_detail_label(label: str) -> str:
         "made in": "Place of Origin",
         "date of manufacture": "Date of Manufacture",
         "year of manufacture": "Date of Manufacture",
+        "material": "Material",
         "materials": "Material",
         "materials and techniques": "Materials and Techniques",
         "designed by": "Designer",
@@ -1035,6 +1111,10 @@ def normalize_detail_label(label: str) -> str:
         "maker": "Manufacturer",
         "reference number": "Reference Number",
         "ref": "Reference Number",
+        "condition": "Condition",
+        "period": "Period",
+        "style": "Style",
+        "barcode": "Barcode",
     }
     if lower in canonical_labels:
         return canonical_labels[lower]
@@ -1571,8 +1651,196 @@ def extract_sitonvintage_product_info(soup: BeautifulSoup, base_url: str) -> dic
     return info
 
 
+def detail_lines_from_block(block: Any) -> list[str]:
+    return [
+        clean_text(line)
+        for line in (block.get_text("\n").splitlines() if block else [])
+        if clean_text(line)
+    ]
+
+
+def extract_morentz_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    product_info = soup.select_one(".product-info")
+    if product_info is None:
+        return {}
+
+    heading = product_info.select_one(".product-title, h1") or soup.find("h1")
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+
+    lines = detail_lines_from_block(product_info)
+    price = ""
+    for line in lines:
+        if line_looks_like_price(line):
+            price = clean_price_text(line)
+            break
+
+    description_lines: list[str] = []
+    prose = product_info.select_one(".prose")
+    if prose is not None:
+        for text in detail_lines_from_block(prose):
+            if text and not re.search(r"^(Share|Tearsheet)$", text, re.I):
+                description_lines.append(text)
+    description = clean_text(" ".join(description_lines))
+
+    details: dict[str, Any] = {}
+    metafields = soup.select_one(".product-metafields")
+    metafield_lines = detail_lines_from_block(metafields)
+    for index in range(0, len(metafield_lines) - 1, 2):
+        label = metafield_lines[index]
+        value = metafield_lines[index + 1]
+        detail_key = normalize_detail_label(label)
+        if detail_key == "dimensions":
+            existing = str(details.get("dimensions") or "")
+            dimension_value = clean_dimension_text(value)
+            details["dimensions"] = clean_text("; ".join(item for item in [existing, dimension_value] if item))
+        else:
+            details[detail_key] = clean_detail_value(value)
+
+    info: dict[str, Any] = {"source": "morentz-product-page", "url": base_url}
+    if name:
+        info["name"] = name
+    if price:
+        info["price"] = price
+    if description:
+        info["description"] = description
+    if details:
+        info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
+    add_synthesized_dimensions(info)
+    return info
+
+
+def extract_hgallery_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    summary = soup.select_one(".ProductItem-summary")
+    if summary is None:
+        return {}
+
+    heading = summary.select_one(".ProductItem-details-title, h1")
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    lines = detail_lines_from_block(summary)
+
+    details: dict[str, Any] = {}
+    description_lines: list[str] = []
+    condition_lines: list[str] = []
+    dimension_lines: list[str] = []
+    price = ""
+    section = ""
+    for line in lines:
+        if not line or line == name or re.match(r"^(REQUEST PRICE|HERE|Add To Cart)$", line, re.I):
+            continue
+        if re.match(r"^[£$€]\s*0(?:[.,]0+)?$", line):
+            continue
+        price_category = re.match(r"^Price\s+category\s*:\s*(.+)$", line, re.I)
+        if price_category:
+            price = clean_price_text(price_category.group(1))
+            details["Price category"] = clean_text(price_category.group(1))
+            section = "description"
+            continue
+        if re.match(r"^Condition\s*:?\s*$", line, re.I):
+            section = "condition"
+            continue
+        if re.match(r"^Dimensions?\s*:?\s*$", line, re.I):
+            section = "dimensions"
+            continue
+        if section == "condition":
+            condition_lines.append(line)
+        elif section == "dimensions":
+            if line_looks_like_dimensions(line) or re.search(r"\d.*\b(?:cm|in|inch|inches)\b", line, re.I):
+                dimension_lines.append(clean_dimension_text(line))
+        elif section == "description":
+            description_lines.append(line)
+
+    condition = clean_text(" ".join(condition_lines))
+    dimensions = clean_text("; ".join(dimension_lines))
+    description = clean_text(" ".join(description_lines))
+
+    if condition:
+        details["Condition"] = condition
+    if dimensions:
+        details["dimensions"] = dimensions
+
+    info: dict[str, Any] = {"source": "hgallery-product-page", "url": base_url}
+    if name:
+        info["name"] = name
+    if price:
+        info["price"] = price
+        if re.search(r"\busd\b", price, re.I):
+            info["currency"] = "USD"
+        elif re.search(r"\beur\b", price, re.I):
+            info["currency"] = "EUR"
+    if description:
+        info["description"] = description
+    if details:
+        info["details"] = details
+    if details.get("dimensions"):
+        info["dimensions"] = str(details["dimensions"])
+    add_synthesized_dimensions(info)
+    return info
+
+
+def extract_squarespace_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    heading = (
+        soup.select_one("h1.ProductItem-details-title")
+        or soup.select_one("h1.product-title")
+        or soup.select_one(".ProductItem-details-title")
+        or soup.select_one(".product-title")
+    )
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    if not name:
+        return {}
+    return {
+        "source": "squarespace-product-page",
+        "url": base_url,
+        "name": name,
+    }
+
+
+def extract_oldboy_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    heading = soup.find("h2") or soup.find("h1")
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    if not name:
+        return {}
+    return {
+        "source": "oldboy-product-page",
+        "url": base_url,
+        "name": name,
+    }
+
+
+def extract_simple_heading_product_info(
+    soup: BeautifulSoup,
+    base_url: str,
+    selector: str,
+    source: str,
+) -> dict[str, Any]:
+    heading = soup.select_one(selector)
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    if not name:
+        return {}
+    return {
+        "source": source,
+        "url": base_url,
+        "name": name,
+    }
+
+
 def extract_domain_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
     hostname = normalized_hostname(base_url)
+    if hostname in MORENTZ_DOMAINS:
+        return extract_morentz_product_info(soup, base_url)
+    if hostname in HGALLERY_DOMAINS:
+        return extract_hgallery_product_info(soup, base_url)
+    if hostname in AERA_LAB_DOMAINS:
+        return extract_simple_heading_product_info(soup, base_url, "h2", "aera-lab-product-page")
+    if hostname in QUITTENBAUM_DOMAINS:
+        return extract_simple_heading_product_info(soup, base_url, ".auction-object-title", "quittenbaum-product-page")
+    if hostname in WOO_PRODUCT_TITLE_DOMAINS:
+        return extract_simple_heading_product_info(soup, base_url, "h1.product_title", "woocommerce-product-page")
+    if hostname in SQUARESPACE_PRODUCT_DOMAINS:
+        return extract_squarespace_product_info(soup, base_url)
+    if hostname in OLD_BOY_DOMAINS:
+        return extract_oldboy_product_info(soup, base_url)
     if hostname in FUNDAMENTE_DOMAINS:
         return extract_fundamente_product_info(soup, base_url)
     if hostname in SITONVINTAGE_DOMAINS:
@@ -2617,10 +2885,12 @@ def extract(
         product_info = merge_product_info(product_info, info)
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
     product_info = merge_product_info(dom_info, product_info)
-    product_info = merge_product_info(domain_info, product_info)
     product_info = merge_product_info(analytics_info, product_info)
     product_info = merge_product_info(nextjs_info, product_info)
     product_info = merge_product_info(auctionet_info, product_info)
+    product_info = merge_product_info(domain_info, product_info)
+    if isinstance(domain_info.get("details"), dict):
+        product_info["details"] = domain_info["details"]
     add_synthesized_dimensions(product_info)
     product_info["page_url"] = final_url
 

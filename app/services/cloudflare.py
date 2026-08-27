@@ -12,7 +12,7 @@ from typing import Any
 
 logger = logging.getLogger("uvicorn.error")
 
-BLOCKED_MARKERS = [
+BLOCKED_TITLE_MARKERS = [
     "just a moment",
     "please wait",
     "请稍候",
@@ -20,6 +20,12 @@ BLOCKED_MARKERS = [
     "正在檢查",
     "attention required",
     "access denied",
+]
+BLOCKED_BODY_MARKERS = [
+    "checking if the site connection is secure",
+    "verify you are human",
+    "正在进行安全验证",
+    "正在檢查",
     "cf-error",
     "sorry, you have been blocked",
 ]
@@ -135,8 +141,12 @@ def cloudflare_semaphore() -> threading.BoundedSemaphore:
 
 
 def is_cloudflare_blocked(title: str, body_text: str, html: str = "") -> bool:
-    haystack = f"{title}\n{body_text}\n{html[:30000]}".lower()
-    return any(marker in haystack for marker in BLOCKED_MARKERS)
+    title_text = title.lower()
+    body = body_text.lower()
+    snippet = html[:30000].lower()
+    if any(marker in title_text for marker in BLOCKED_TITLE_MARKERS):
+        return True
+    return any(marker in body or marker in snippet for marker in BLOCKED_BODY_MARKERS)
 
 
 def playwright_chromium_candidates() -> list[str]:
