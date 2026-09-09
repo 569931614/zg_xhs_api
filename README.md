@@ -236,7 +236,7 @@ Content-Type: application/json
 `/api/xianyu/copy` 同样支持 `urls` 数组。流程会先抓取商品标题、价格、尺寸、详情和主商品图，上传图片后传给火山方舟 Doubao 视觉模型生成闲鱼标题和正文，不发布到闲鱼。
 
 闲鱼正文中的尺寸统一使用 `cm`；如果源站尺寸为英寸，会按 `1 inch = 2.54 cm` 换算后再生成正文。
-闲鱼正文会尽量包含抓取到的国家/产地；除尺寸行和固定收尾句外，中间正文主段控制在 120-200 字。固定收尾句会单独一行。
+闲鱼正文仅在源站抓取到明确国家/产地时包含该信息；源站没有该字段属于正常情况，不会据此失败。除尺寸行和固定收尾句外，中间正文主段控制在 120-200 字。固定收尾句会单独一行。
 
 价格字段由服务端按固定公式计算：
 
@@ -264,7 +264,9 @@ Content-Type: application/json
 ```
 
 `xianyu_copy` 为合并后的闲鱼文案，格式是标题、空行、正文。
-`product_type` 为产品类型，例如 `灯具`、`椅子`、`长凳`。
+`product_type` 为由视觉模型结合商品标题、页面文字和产品图片识别出的产品类型，例如 `灯具`、`椅子`、`长凳`、`雕塑`。服务不会使用英文关键词或固定分类表进行产品归类；模型未返回有效品类时会触发重试。
+
+制作者、设计师、制造商和艺术家只能来自商品名称、商品描述或商品详情中明确提供的作品资料。来源网站名称、域名、画廊名称、销售平台名称和链接地址不会作为制作者依据；抓取阶段会过滤这类站点身份，文案生成阶段如果仍将其写成制作者，会拒绝本次结果并重试。
 `image_links` 为获取到的产品图链接，保持原顺序返回。
 
 遇到 Cloudflare / bot verification 等页面时，服务会自动尝试 Cloudflare fallback。fallback 未安装依赖、缺少浏览器、验证未通过或被禁用时，接口会返回 `502`，错误信息类似：
@@ -322,9 +324,9 @@ ARK_IMAGE_TIMEOUT=600
 ARK_REFERENCE_MAX_PIXELS=36000000
 ARK_CHAT_COMPLETIONS_URL=https://ark.cn-beijing.volces.com/api/v3/chat/completions
 XIANYU_COPY_MODEL=doubao-seed-2-0-pro-260215
-XIANYU_COPY_MAX_IMAGES=4
-XIANYU_COPY_MAX_ATTEMPTS=5
-XIANYU_COPY_RETRY_DELAY=1
+XIANYU_COPY_MAX_IMAGES=2
+XIANYU_COPY_MAX_ATTEMPTS=3
+XIANYU_COPY_RETRY_DELAY=0
 XHS_EXPAND_MAX_ATTEMPTS=3
 XHS_EXPAND_RETRY_DELAY=5
 DUOMI_API_KEY=你的多米API key
@@ -374,9 +376,9 @@ XHS_POST_API_KEY=xhs_post
 - `XHS_PUBLISH_RETRY_DELAY`：小红书发布重试前等待秒数，默认 `2`
 - `ARK_CHAT_COMPLETIONS_URL`：火山方舟对话补全接口地址，闲鱼文案使用。
 - `XIANYU_COPY_MODEL`：闲鱼文案使用的 Doubao 2.0 Pro 模型，默认 `doubao-seed-2-0-pro-260215`
-- `XIANYU_COPY_MAX_IMAGES`：传给闲鱼文案视觉模型的图片数量，默认 `4`，最大 `8`
-- `XIANYU_COPY_MAX_ATTEMPTS`：闲鱼文案生成失败后的最大尝试次数，默认 `5`，最大 `5`
-- `XIANYU_COPY_RETRY_DELAY`：闲鱼文案重试前等待秒数，默认 `1`
+- `XIANYU_COPY_MAX_IMAGES`：传给闲鱼文案视觉模型的图片数量，默认 `2`，最大 `8`；接口返回的商品图片数量不受此项限制
+- `XIANYU_COPY_MAX_ATTEMPTS`：闲鱼文案生成失败后的最大尝试次数，默认 `3`，最大 `3`
+- `XIANYU_COPY_RETRY_DELAY`：闲鱼文案重试前等待秒数，默认 `0`
 - `XHS_EXPAND_MAX_ATTEMPTS`：封面扩图最大尝试次数，默认 `3`
 - `XHS_EXPAND_RETRY_DELAY`：封面扩图失败后的重试间隔秒数，默认 `5`
 

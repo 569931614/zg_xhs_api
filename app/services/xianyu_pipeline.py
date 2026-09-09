@@ -12,6 +12,7 @@ from typing import Any
 
 import requests
 
+from app.services.extractor import contains_source_site_name
 from app.services.xhs_pipeline import product_text
 
 
@@ -20,6 +21,9 @@ DEFAULT_XIANYU_COPY_MODEL = "doubao-seed-2-0-pro-260215"
 XIANYU_CLOSING_LINE = "可预定，货期90-150天，国内运费到付，喜欢私聊"
 XIANYU_BODY_MIN_CHARS = 120
 XIANYU_BODY_MAX_CHARS = 200
+NUMBER_PATTERN = r"\d+(?:[.,]\d+)?"
+INCH_SYMBOL_PATTERN = r'["″”](?![A-Za-z0-9_\u4e00-\u9fff])'
+INCH_UNIT_PATTERN = rf"(?:inch(?:es)?\b|in\b|英寸|吋|{INCH_SYMBOL_PATTERN})"
 COUNTRY_TRANSLATIONS = {
     "aland islands": "",
     "austria": "奥地利",
@@ -212,31 +216,78 @@ def inch_text_to_cm(value: str) -> str:
     return format_cm(amount * Decimal("2.54"))
 
 
+def contains_inch_unit(text: str) -> bool:
+    return bool(
+        re.search(rf"{NUMBER_PATTERN}\s*{INCH_UNIT_PATTERN}", text, re.I)
+        or re.search(r"(?:\binch(?:es)?\b|英寸|吋)", text, re.I)
+    )
+
+
+def normalize_inch_units_to_cm(value: Any) -> str:
+    text = str(value or "").replace("\xa0", " ")
+    if not text:
+        return ""
+
+    converted = re.sub(
+        rf"{NUMBER_PATTERN}\s*{INCH_UNIT_PATTERN}\s*\(\s*({NUMBER_PATTERN})\s*cm\s*\)",
+        lambda match: f"{match.group(1).replace(',', '.')} cm",
+        text,
+        flags=re.I,
+    )
+    converted = re.sub(
+        rf"({NUMBER_PATTERN})\s*cm\s*\(\s*{NUMBER_PATTERN}\s*{INCH_UNIT_PATTERN}\s*\)",
+        lambda match: f"{match.group(1).replace(',', '.')} cm",
+        converted,
+        flags=re.I,
+    )
+
+    def convert_dimension_group(match: re.Match[str]) -> str:
+        values = re.findall(NUMBER_PATTERN, match.group(1))
+        if not values:
+            return match.group(0)
+        return " x ".join(inch_text_to_cm(value) for value in values) + " cm"
+
+    converted = re.sub(
+        rf"(?<![\d.,])({NUMBER_PATTERN}(?:\s*(?:x|×)\s*{NUMBER_PATTERN})+)\s*{INCH_UNIT_PATTERN}",
+        convert_dimension_group,
+        converted,
+        flags=re.I,
+    )
+    converted = re.sub(
+        rf"({NUMBER_PATTERN})\s*{INCH_UNIT_PATTERN}",
+        lambda match: f"{inch_text_to_cm(match.group(1))} cm",
+        converted,
+        flags=re.I,
+    )
+    converted = re.sub(r"(?:\binch(?:es)?\b|英寸|吋)", "cm", converted, flags=re.I)
+    return re.sub(r"\s+", " ", converted).strip()
+
+
 def normalize_dimensions_to_cm(value: Any) -> str:
     text = " ".join(str(value or "").replace("\xa0", " ").split())
     if not text:
         return ""
 
-    has_inches = bool(re.search(r'(?:\binches?\b|\bin\b|["″”])', text, re.I))
+    has_inches = contains_inch_unit(text)
     if not has_inches:
         return text
 
     has_metric = bool(re.search(r"(?<![a-z])(?:cm|centimeters?|centimetres?|mm|m)\b", text, re.I))
     if not has_metric:
-        number_count = len(re.findall(r"\d+(?:[.,]\d+)?", text))
-        explicit_unit_count = len(re.findall(r'\d+(?:[.,]\d+)?\s*(?:inches?\b|in\b|["″”])', text, re.I))
+        number_count = len(re.findall(NUMBER_PATTERN, text))
+        explicit_unit_count = len(re.findall(rf"{NUMBER_PATTERN}\s*{INCH_UNIT_PATTERN}", text, re.I))
         if re.search(r"[x×]", text) and explicit_unit_count < number_count:
             converted = re.sub(
-                r"\d+(?:[.,]\d+)?",
+                NUMBER_PATTERN,
                 lambda match: inch_text_to_cm(match.group(0)),
                 text,
             )
-            converted = re.sub(r'\s*(?:inches?\b|in\b|["″”])', "", converted, flags=re.I)
+            converted = re.sub(rf"\s*{INCH_UNIT_PATTERN}", "", converted, flags=re.I)
             converted = re.sub(r"\s+", " ", converted).strip()
             return converted if re.search(r"\bcm\b", converted, re.I) else f"{converted} cm"
 
         converted = re.sub(
-            r'\d+(?:[.,]\d+)?\s*(?:inches?\b|in\b|["″”])',
+            rf"{NUMBER_PATTERN}\s*{INCH_UNIT_PATTERN}",
             lambda match: f"{inch_text_to_cm(match.group(0))} cm",
             text,
             flags=re.I,
@@ -244,26 +295,7 @@ def normalize_dimensions_to_cm(value: Any) -> str:
         converted = re.sub(r"\s+", " ", converted).strip()
         return converted
 
-    # Mixed strings such as "10 in (25 cm)" keep the existing centimeter value.
-    converted = re.sub(
-        r"\d+(?:[.,]\d+)?\s*(?:inches?\b|in\b|[\"″”])\s*\(\s*(\d+(?:[.,]\d+)?)\s*cm\s*\)",
-        lambda match: f"{match.group(1).replace(',', '.')} cm",
-        text,
-        flags=re.I,
-    )
-    converted = re.sub(
-        r"(\d+(?:[.,]\d+)?)\s*cm\s*\(\s*\d+(?:[.,]\d+)?\s*(?:inches?\b|in\b|[\"″”])\s*\)",
-        lambda match: f"{match.group(1).replace(',', '.')} cm",
-        converted,
-        flags=re.I,
-    )
-    converted = re.sub(
-        r"\d+(?:[.,]\d+)?\s*(?:inches?\b|in\b|[\"″”])",
-        lambda match: f"{inch_text_to_cm(match.group(0))} cm",
-        converted,
-        flags=re.I,
-    )
-    return re.sub(r"\s+", " ", converted).strip()
+    return normalize_inch_units_to_cm(text)
 
 
 def product_with_cm_dimensions(product: dict[str, Any]) -> dict[str, Any]:
@@ -422,9 +454,27 @@ def looks_like_country_value(text: str) -> bool:
 
 def extract_product_country(product: dict[str, Any]) -> str:
     details = product.get("product_details") if isinstance(product.get("product_details"), dict) else {}
-    country_keys = ("Place of Origin", "Origin", "Country")
-    for key in country_keys:
-        country = normalize_country_text(details.get(key), allow_freeform=True)
+    explicit_country_key_names = {
+        "placeoforigin",
+        "countryoforigin",
+        "countryofmanufacture",
+        "landvanherkomst",
+        "origincountry",
+        "productioncountry",
+        "madein",
+    }
+    generic_country_key_names = {
+        "origin",
+        "country",
+    }
+    for key, value in details.items():
+        normalized_key = re.sub(r"[\s_.-]+", "", str(key).lower())
+        if normalized_key in explicit_country_key_names:
+            country = normalize_country_text(value, allow_freeform=True)
+        elif normalized_key in generic_country_key_names:
+            country = normalize_country_text(value, allow_freeform=False)
+        else:
+            continue
         if country:
             return country
 
@@ -433,7 +483,7 @@ def extract_product_country(product: dict[str, Any]) -> str:
         return name_country
 
     for key in ("Origin / period", "Origin / Period"):
-        country = normalize_country_text(details.get(key), allow_freeform=True)
+        country = normalize_country_text(details.get(key), allow_freeform=False)
         if country:
             return country
 
@@ -442,6 +492,19 @@ def extract_product_country(product: dict[str, Any]) -> str:
         for value in [product.get("description"), details.get("description"), *details.values()]
     )
     return contextual_country_from_text(strip_non_product_country_context(haystack))
+
+
+def ensure_xianyu_body_contains_country(body: str, product: dict[str, Any]) -> str:
+    country = extract_product_country(product)
+    if not country or text_contains_origin(body, country):
+        return body
+    body = body.lstrip()
+    suffix = "值得收藏" if body.endswith("值得收藏") else ""
+    body_core = body[: -len(suffix)] if suffix else body
+    max_core_chars = max(0, XIANYU_BODY_MAX_CHARS - len(country) - len(suffix))
+    if len(body_core) > max_core_chars:
+        body_core = body_core[:max_core_chars].rstrip("，,。；; ")
+    return f"{country}{body_core}{suffix}"
 
 
 def xianyu_display_dimensions(product: dict[str, Any]) -> str:
@@ -474,6 +537,8 @@ def normalize_xianyu_content_dimensions(content: str, product: dict[str, Any], p
     body = body.replace(f"\"{XIANYU_CLOSING_LINE}\"", XIANYU_CLOSING_LINE)
     if XIANYU_CLOSING_LINE in body:
         body = body.replace(XIANYU_CLOSING_LINE, "").strip(" ，,。；;")
+    body = normalize_inch_units_to_cm(body)
+    body = ensure_xianyu_body_contains_country(body, product)
     body = clean_collection_punctuation(body)
     lines_out = [f"尺寸：{dimensions}"]
     if body:
@@ -507,21 +572,20 @@ def validate_xianyu_copy(title: str, content: str, product: dict[str, Any], prod
             reasons.append("正文第一行不是尺寸行")
         if lines[2] != XIANYU_CLOSING_LINE:
             reasons.append("固定预定句没有单独作为最后一行")
+        if not body:
+            reasons.append("正文主段为空")
+        else:
+            body_len = len(body)
+            if body_len < XIANYU_BODY_MIN_CHARS or body_len > XIANYU_BODY_MAX_CHARS:
+                reasons.append(f"正文主段字数为{body_len}，不在{XIANYU_BODY_MIN_CHARS}-{XIANYU_BODY_MAX_CHARS}字范围内")
+            if country and not text_contains_origin(body, country):
+                reasons.append(f"正文主段未包含国家/产地：{country}")
+            if re.match(r"^(?:这是|本款为|本件为|本品为|这款|这件)", body):
+                reasons.append("正文主段应直接以产品信息开头，不应以“这是”“本款为”“本件为”等套话开头")
+            if not body.endswith("值得收藏"):
+                reasons.append("正文主段未以“值得收藏”结尾")
 
-    if not body:
-        reasons.append("正文主段为空")
-    else:
-        body_len = len(body)
-        if body_len < XIANYU_BODY_MIN_CHARS or body_len > XIANYU_BODY_MAX_CHARS:
-            reasons.append(f"正文主段字数为{body_len}，不在{XIANYU_BODY_MIN_CHARS}-{XIANYU_BODY_MAX_CHARS}字范围内")
-        if country and not text_contains_origin(body, country):
-            reasons.append(f"正文主段未包含国家/产地：{country}")
-        if re.match(r"^(?:这是|本款为|本件为|本品为|这款|这件)", body):
-            reasons.append("正文主段应直接以产品信息开头，不应以“这是”“本款为”“本件为”等套话开头")
-        if not body.endswith("值得收藏"):
-            reasons.append("正文主段未以“值得收藏”结尾")
-
-    if re.search(r'(?:\binches?\b|\bin\b|["″”]|英寸)', content, re.I):
+    if contains_inch_unit(content):
         reasons.append("正文仍包含英寸单位")
 
     if not product_type:
@@ -538,8 +602,8 @@ def xianyu_product_text(product: dict[str, Any], calculated_price: str) -> str:
     country = extract_product_country(product)
     if country:
         lines.append(f"国家/产地：{country}")
-    if product.get("source_url"):
-        lines.append(f"商品链接：{product['source_url']}")
+    else:
+        lines.append("国家/产地：源站未提供可确认信息，禁止推断或补写")
     if product.get("price"):
         currency = str(product.get("currency") or "").strip()
         lines.append(f"网站标价：{product['price']}{f' {currency}' if currency else ''}")
@@ -552,11 +616,11 @@ def xianyu_product_text(product: dict[str, Any], calculated_price: str) -> str:
 
 
 def xianyu_image_links(product: dict[str, Any]) -> list[str]:
-    max_images_raw = os.getenv("XIANYU_COPY_MAX_IMAGES", "4").strip()
+    max_images_raw = os.getenv("XIANYU_COPY_MAX_IMAGES", "2").strip()
     try:
         max_images = max(1, min(8, int(max_images_raw)))
     except ValueError:
-        max_images = 4
+        max_images = 2
     return [
         str(url).strip()
         for url in product.get("image_links") or []
@@ -564,20 +628,50 @@ def xianyu_image_links(product: dict[str, Any]) -> list[str]:
     ][:max_images]
 
 
-def xianyu_copy_max_attempts() -> int:
-    raw_value = os.getenv("XIANYU_COPY_MAX_ATTEMPTS", "5").strip()
+def xianyu_model_image_links(product: dict[str, Any]) -> list[str]:
+    max_images_raw = os.getenv("XIANYU_COPY_MAX_IMAGES", "2").strip()
     try:
-        return max(1, min(5, int(raw_value)))
+        max_images = max(1, min(8, int(max_images_raw)))
     except ValueError:
-        return 5
+        max_images = 2
+
+    data_urls = [
+        str(url).strip()
+        for url in product.get("_model_image_data_urls") or []
+        if str(url).strip().startswith("data:image/jpeg;base64,")
+    ]
+    if data_urls:
+        return data_urls[:max_images]
+    return xianyu_image_links(product)
+
+
+def is_permanent_ark_error(error: Exception) -> bool:
+    text = str(error)
+    markers = (
+        "ModelNotOpen",
+        "UnsupportedImageFormat",
+        "Timeout while downloading url=",
+        "Error while downloading:",
+        "status code: 400",
+        "status code: 403",
+    )
+    return any(marker in text for marker in markers)
+
+
+def xianyu_copy_max_attempts() -> int:
+    raw_value = os.getenv("XIANYU_COPY_MAX_ATTEMPTS", "3").strip()
+    try:
+        return max(1, min(3, int(raw_value)))
+    except ValueError:
+        return 3
 
 
 def xianyu_copy_retry_delay() -> float:
-    raw_value = os.getenv("XIANYU_COPY_RETRY_DELAY", "1").strip()
+    raw_value = os.getenv("XIANYU_COPY_RETRY_DELAY", "0").strip()
     try:
         return max(0.0, float(raw_value))
     except ValueError:
-        return 1.0
+        return 0.0
 
 
 def xianyu_retry_instruction(error: Exception) -> str:
@@ -614,33 +708,25 @@ def parse_copy_payload(content: str) -> dict[str, str]:
     return {"title": parts[0], "content": text[len(parts[0]) :].strip(), "product_type": "", "price": ""}
 
 
-def infer_product_type(product: dict[str, Any], title: str = "", content: str = "") -> str:
-    details = product.get("product_details") if isinstance(product.get("product_details"), dict) else {}
-    haystack = " ".join(
-        str(value or "")
-        for value in [
-            product.get("name"),
-            title,
-            content,
-            details.get("description"),
-            *details.values(),
-        ]
-    ).lower()
-    type_keywords = [
-        ("灯具", ("lamp", "lamps", "lighting", "light", "pendant", "chandelier", "sconce", "lantern", "floor lamp", "table lamp", "壁灯", "台灯", "吊灯", "落地灯", "灯具")),
-        ("长凳", ("bench", "长凳")),
-        ("椅子", ("chair", "chairs", "armchair", "stool", "椅", "凳")),
-        ("桌子", ("table", "desk", "console", "coffee table", "dining table", "桌", "几")),
-        ("柜子", ("cabinet", "sideboard", "credenza", "commode", "dresser", "chest", "柜")),
-        ("沙发", ("sofa", "settee", "loveseat", "沙发")),
-        ("镜子", ("mirror", "镜")),
-        ("床", ("bed", "daybed", "床")),
-        ("屏风", ("screen", "屏风")),
-    ]
-    for product_type, keywords in type_keywords:
-        if any(keyword in haystack for keyword in keywords):
-            return product_type
-    return ""
+def generated_copy_uses_source_site_as_creator(
+    title: str,
+    content: str,
+    product: dict[str, Any],
+) -> bool:
+    source_url = str(product.get("source_url") or "").strip()
+    if not source_url:
+        return False
+    output = f"{title}\n{content}"
+    if not contains_source_site_name(output, source_url):
+        return False
+    return bool(
+        re.search(
+            r"(?:制造商|生产|制作者|制作|设计师|设计|作者|艺术家|出品|"
+            r"manufacturer|made\s+by|designed\s+by|producer|creator|artist)",
+            output,
+            re.I,
+        )
+    )
 
 
 def generate_xianyu_copy(
@@ -650,8 +736,9 @@ def generate_xianyu_copy(
 ) -> tuple[str, str, str, str]:
     started = time.monotonic()
     calculated_price = calculate_xianyu_price(str(product.get("price") or ""))
-    image_links = xianyu_image_links(product)
-    if not image_links:
+    country = extract_product_country(product)
+    model_image_links = xianyu_model_image_links(product)
+    if not model_image_links:
         raise XianyuPipelineError("No product images were found for Xianyu copy creation")
     system_prompt = """假如你是旨丘画廊的CMO，请为上图这件作品写一段文案用于闲鱼，生成标题、正文、价格。
 
@@ -664,18 +751,19 @@ def generate_xianyu_copy(
 }
 
 要求如下：
-1、标题：先获取网站商品标题；若商品标题不是英文，必须先准确翻译成英文。英文标题后请根据商品链接文字内容写中文描述，中文描述格式为：什么国家什么年代的什么特征的什么品类家具；上述某个信息如没有出现就直接忽略，不要在标题中文描述里写设计师或制造商。
+1、标题：先获取网站商品标题；若商品标题不是英文，必须先准确翻译成英文。英文标题后请根据商品链接文字内容写中文描述，中文描述格式为：什么国家什么年代的什么特征的什么品类作品；上述某个信息如没有出现就直接忽略，不要在标题中文描述里写设计师或制造商。
 标题按照以下格式：【中古预定】+英文商品标题+中文描述。英文商品标题部分不要包含价格、库存编号、Item 编号或网站名。
 2、正文第一句必须是尺寸行：抓取网站尺寸；若无，写“尺寸：详询”。所有尺寸必须统一使用 cm；若源站尺寸为英寸，使用已换算后的 cm 尺寸，不要在正文保留 inch、in、英寸或双引号英寸符号。
-3、正文必须包含国家/产地；若产品信息里有国家/产地，正文主段必须明确写出该国家。
+3、国家/产地：仅当产品详细信息或下方“国家/产地”字段明确提供时，正文主段才必须写出该国家/产地；如果产品信息没有该字段，视为正常，禁止根据图片、风格、设计师、制造商、网站所在地或常识推断，也不要输出“未知”“未提供”等占位词。
 4、正文除第一句尺寸和最后一句预定信息外，中间正文主段必须写120-200字，合并成一个连续段落，不要空行，不要分段；正文主段必须直接以产品信息开头，例如“瑞典1940年代Bjerkås Armatur生产的做旧铁艺吊灯…”，不要以“这是”“本款为”“本件为”“本品为”“这款”“这件”等套话开头。
-5、中间正文主段只写两句：第一句写图片文字上能获取的所有基本信息，包括什么国家什么年代由什么设计师设计、什么制造商生产的什么品类及特征的家具。
+5、中间正文主段只写两句：第一句写图片文字上能获取的所有基本信息，包括什么国家什么年代由什么设计师设计、什么制造商生产的什么品类及特征的作品。
 6、中间正文主段第二句结合产品照片及其文字描写其独特性和收藏性展开，需要以画廊专业角度去写，并以“值得收藏”这几个字结尾。
 7、不要额外增加日常使用场景或实用性句子。
 8、正文最后一句必须单独一行，并严格写为：“可预定，货期90-150天，国内运费到付，喜欢私聊”
-9、产品类型：根据商品标题、页面文字和图片判断产品品类，用简短中文名返回，例如“灯具”“椅子”“长凳”“桌子”“柜子”“沙发”“镜子”。
+9、产品类型：必须由你结合商品标题、页面文字和产品图片独立判断，返回最准确的简短中文品类，不得套用固定分类表，也不得依赖关键词匹配。先判断它是什么实际物件，再确定品类；雕塑、绘画、艺术品、陶艺、花器、摆件等应按其真实类别识别，不能因为它用于装饰或出现在家具画廊就归为桌子、柜子或其他家具。比如“Abstract Terracotta Sculpture”应识别为“雕塑”，而不是“家具”“摆件”或“桌子”。只返回品类名称，不要返回判断过程、英文、斜杠或多个候选。
 10、价格：使用用户提供的人民币售价，不要自行换算，不要添加货币符号、逗号或其他文字。
-11、不要编造产品信息；没有出现的国家、年代、设计师、制造商、材质信息直接忽略。"""
+11、制作者、设计师、制造商、艺术家只能使用商品名称、商品描述或商品详情中明确出现的作品资料；网站名、域名、画廊名、销售平台名、页面品牌名和链接地址都不是制作者证据。若商品资料没有明确制作者，就不要写任何制作者，不得把网站或画廊名称写成“某某生产”“某某制造”“某某设计”。
+12、不要编造产品信息；没有出现的国家、年代、设计师、制造商、材质信息直接忽略。"""
     user_prompt = (
         f"产品详细信息如下：\n{xianyu_product_text(product, calculated_price)}\n\n"
         f"请根据以上信息生成闲鱼标题、正文、价格。若产品标题不是英文，先翻译成英文再用于标题。价格字段必须填：{calculated_price or '空字符串'}"
@@ -683,11 +771,13 @@ def generate_xianyu_copy(
     model = os.getenv("XIANYU_COPY_MODEL") or os.getenv("ARK_VISION_MODEL") or DEFAULT_XIANYU_COPY_MODEL
     url = os.getenv("ARK_CHAT_COMPLETIONS_URL", ARK_CHAT_COMPLETIONS_URL)
     logger.info(
-        "xianyu stage=generate_copy_start request_id=%s job_id=%s provider=ark model=%s images=%d source_price=%r calculated_price=%r",
+        "xianyu stage=generate_copy_start request_id=%s job_id=%s provider=ark model=%s images=%d country_found=%s country=%r source_price=%r calculated_price=%r",
         request_id_value,
         job_id,
         model,
-        len(image_links),
+        len(model_image_links),
+        bool(country),
+        country,
         product.get("price", ""),
         calculated_price,
     )
@@ -698,7 +788,7 @@ def generate_xianyu_copy(
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     user_content.extend(
         {"type": "image_url", "image_url": {"url": image_url}}
-        for image_url in image_links
+        for image_url in model_image_links
     )
     attempts = xianyu_copy_max_attempts()
     retry_delay = xianyu_copy_retry_delay()
@@ -713,8 +803,8 @@ def generate_xianyu_copy(
                     "text": (
                         f"上一次输出不合格，失败原因：{last_error}。\n"
                         f"{xianyu_retry_instruction(last_error)}"
-                        "不要复用不合格结果；尤其确保正文主段为120-200字、只写两句、包含国家/产地、直接以产品信息开头、不要以“这是”“本款为”“本件为”等套话开头、以“值得收藏”结尾，"
-                        "并让“可预定，货期90-150天，国内运费到付，喜欢私聊”单独作为最后一行。"
+                        "不要复用不合格结果；尤其确保正文主段为120-200字、仅在产品信息提供时包含国家/产地、直接以产品信息开头、不要以“这是”“本款为”“本件为”等套话开头、以“值得收藏”结尾，"
+                        "并让“可预定，货期90-150天，国内运费到付，喜欢私聊”单独作为最后一行。请重新结合图片和完整资料识别 product_type，不能留空，不能使用关键词或固定映射，若主体是雕塑就返回“雕塑”；制作者只能来自商品资料，禁止使用网站、域名或画廊名称。"
                     ),
                 }
             )
@@ -755,11 +845,12 @@ def generate_xianyu_copy(
             raw_content = str(payload["choices"][0]["message"]["content"]).strip()
             parsed = parse_copy_payload(raw_content)
             title = parsed["title"]
-            product_type = parsed["product_type"] or infer_product_type(product, title, parsed["content"])
+            product_type = parsed["product_type"]
             body = normalize_xianyu_content_dimensions(parsed["content"], product, product_type)
-            product_type = product_type or infer_product_type(product, title, body)
             if not title or not body:
                 raise XianyuCopyValidationError(["Ark 返回的闲鱼文案不完整"])
+            if generated_copy_uses_source_site_as_creator(title, body, product):
+                raise XianyuCopyValidationError(["文案将来源网站名称误写为制作者"])
             validate_xianyu_copy(title, body, product, product_type)
             logger.info(
                 "xianyu stage=generate_copy_attempt_done request_id=%s job_id=%s attempt=%d title=%r elapsed=%.2fs",
@@ -789,6 +880,8 @@ def generate_xianyu_copy(
                 str(exc),
                 time.monotonic() - attempt_started,
             )
+            if is_permanent_ark_error(exc):
+                break
             if attempt < attempts and retry_delay > 0:
                 time.sleep(retry_delay)
 

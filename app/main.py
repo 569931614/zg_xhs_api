@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,7 +37,7 @@ from app.schemas import (
     XianyuCopyResponse,
 )
 from app.services.auction_list import AuctionListError, extract_auction_list
-from app.services.extractor import extract
+from app.services.extractor import extract, price_is_zero
 from app.services.logging_config import configure_logging
 from app.services.storage import upload_images_to_superbed
 from app.services.xianyu_pipeline import XianyuPipelineError, create_xianyu_copy
@@ -51,9 +52,16 @@ STATIC_DIR = BASE_DIR / "static"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_SCRAPE_CONCURRENCY = 3
 DEFAULT_BATCH_CONCURRENCY = 2
+DEFAULT_XIANYU_CONCURRENCY = 2
+DEFAULT_QUEUE_TIMEOUT = 30
+DEFAULT_SCRAPE_RELAY_URL = "http://110.42.33.54:8000/api/scrape"
+DEFAULT_SCRAPE_RELAY_DOMAINS: set[str] = set()
 _scrape_semaphore: threading.BoundedSemaphore | None = None
 _scrape_semaphore_limit = 0
 _scrape_semaphore_lock = threading.Lock()
+_xianyu_semaphore: threading.BoundedSemaphore | None = None
+_xianyu_semaphore_limit = 0
+_xianyu_semaphore_lock = threading.Lock()
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(
@@ -177,6 +185,114 @@ def url_log_value(url: str) -> str:
     return f"{parsed.netloc}{path}"
 
 
+def env_csv_set(name: str, default: set[str]) -> set[str]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    return {item.strip().lower() for item in raw_value.split(",") if item.strip()}
+
+
+def scrape_relay_url() -> str:
+    return os.getenv("SCRAPE_RELAY_URL", DEFAULT_SCRAPE_RELAY_URL).strip()
+
+
+def scrape_relay_domains() -> set[str]:
+    return env_csv_set("SCRAPE_RELAY_DOMAINS", DEFAULT_SCRAPE_RELAY_DOMAINS)
+
+
+def should_relay_scrape(url: str, relayed: bool = False) -> bool:
+    if relayed:
+        return False
+    relay_url = scrape_relay_url()
+    if not relay_url:
+        return False
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname in scrape_relay_domains()
+
+
+def create_job_result(public_result: dict, prefix: str = "") -> tuple[dict, str, Path]:
+    job_id = f"{int(time.time())}-{uuid.uuid4().hex[:10]}"
+    job_dir = DATA_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    result_path = job_dir / "product_extract.json"
+    result_path.write_text(json.dumps(public_result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if prefix:
+        logger.info("%s job_id=%s job_dir=%s", prefix, job_id, job_dir)
+    return public_result, job_id, job_dir
+
+
+def relay_scrape_url(
+    url: str,
+    payload: ScrapeRequest,
+    request_id_value: str,
+) -> tuple[dict, str, Path]:
+    relay_url = scrape_relay_url()
+    timeout = env_int("SCRAPE_RELAY_TIMEOUT", 180)
+    relay_payload = {
+        "url": url,
+        "render": payload.render,
+        "max_images": payload.max_images,
+        "download_images": payload.download_images,
+    }
+    logger.info(
+        "scrape stage=relay_start request_id=%s relay_url=%s url=%s",
+        request_id_value,
+        relay_url,
+        url_log_value(url),
+    )
+    try:
+        response = requests.post(
+            relay_url,
+            json=relay_payload,
+            headers={"X-Scrape-Relay": "1"},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        logger.exception(
+            "scrape stage=relay_failed request_id=%s relay_url=%s url=%s",
+            request_id_value,
+            relay_url,
+            url_log_value(url),
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to relay scrape request: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = response.text
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict) and parsed.get("detail"):
+                detail = str(parsed["detail"])
+        except ValueError:
+            pass
+        raise HTTPException(
+            status_code=502,
+            detail=f"Relay scrape request failed with HTTP {response.status_code}: {detail}",
+        )
+
+    try:
+        public_result = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Relay scrape request returned invalid JSON") from exc
+
+    try:
+        public_result = ScrapeResponse(**public_result).model_dump()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Relay scrape response has unexpected shape: {exc}") from exc
+
+    logger.info(
+        "scrape stage=relay_done request_id=%s relay_url=%s image_links=%d name=%r",
+        request_id_value,
+        relay_url,
+        len(public_result.get("image_links") or []),
+        public_result.get("name", ""),
+    )
+    return create_job_result(public_result)
+
+
+def is_relay_request(request: Request) -> bool:
+    return request.headers.get("x-scrape-relay", "").strip() == "1"
+
+
 def env_int(name: str, default: int, minimum: int = 1) -> int:
     raw_value = os.getenv(name, str(default)).strip()
     try:
@@ -196,6 +312,40 @@ def scrape_semaphore() -> threading.BoundedSemaphore:
         return _scrape_semaphore
 
 
+def queue_timeout(name: str, default: int = DEFAULT_QUEUE_TIMEOUT) -> int:
+    return env_int(name, default, minimum=0)
+
+
+def xianyu_semaphore() -> threading.BoundedSemaphore:
+    global _xianyu_semaphore, _xianyu_semaphore_limit
+    limit = env_int("XIANYU_CONCURRENCY", DEFAULT_XIANYU_CONCURRENCY)
+    with _xianyu_semaphore_lock:
+        if _xianyu_semaphore is None or _xianyu_semaphore_limit != limit:
+            _xianyu_semaphore = threading.BoundedSemaphore(limit)
+            _xianyu_semaphore_limit = limit
+        return _xianyu_semaphore
+
+
+def acquire_pipeline_slot(
+    semaphore: threading.BoundedSemaphore,
+    name: str,
+    request_id_value: str,
+) -> None:
+    timeout = queue_timeout(f"{name}_QUEUE_TIMEOUT")
+    acquired = semaphore.acquire(timeout=timeout)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail=f"{name.lower()} pipeline is busy; retry after a short delay",
+        )
+    logger.info(
+        "pipeline stage=slot_acquired name=%s request_id=%s queue_timeout=%ss",
+        name,
+        request_id_value,
+        timeout,
+    )
+
+
 def image_link(image: dict) -> str:
     return str(image.get("hosted_url") or image.get("local_url") or image.get("url") or "").strip()
 
@@ -207,19 +357,32 @@ def compact_scrape_result(result: dict, images: list[dict]) -> dict:
     dimensions = str(product.get("dimensions") or product_details.pop("dimensions", "") or "").strip()
     description = str(product.get("description") or "").strip()
     source_url = str(product.get("page_url") or result.get("fetched_url") or result.get("input_url") or "").strip()
+    price = str(product.get("price") or "").strip()
+    currency = str(product.get("currency") or "").strip()
+    if price_is_zero(price):
+        price = ""
+        currency = ""
     if description:
         product_details = {"description": description, **product_details}
     product_details.pop("dimensions", None)
 
-    return {
+    public_result = {
         "name": str(product.get("name") or "").strip(),
-        "price": str(product.get("price") or "").strip(),
-        "currency": str(product.get("currency") or "").strip(),
+        "price": price,
+        "currency": currency,
         "source_url": source_url,
         "image_links": [link for link in (image_link(image) for image in images) if link],
         "dimensions": dimensions,
         "product_details": product_details,
     }
+    model_image_data_urls = [
+        str(image.get("_model_image_data_url") or "").strip()
+        for image in images
+        if str(image.get("_model_image_data_url") or "").strip()
+    ]
+    if model_image_data_urls:
+        public_result["_model_image_data_urls"] = model_image_data_urls[:8]
+    return public_result
 
 
 def extracted_image_links(result: dict) -> list[str]:
@@ -239,6 +402,8 @@ def run_scrape_url(
     payload: ScrapeRequest,
     upload_images: bool = True,
     request_id_value: str | None = None,
+    relayed: bool = False,
+    retry_render_on_missing_dimensions: bool = True,
 ) -> tuple[dict, str, Path]:
     request_id_value = request_id_value or request_id("scrape")
     total_started = time.monotonic()
@@ -252,7 +417,12 @@ def run_scrape_url(
         payload.max_images,
         url_log_value(url_value),
     )
-    semaphore.acquire()
+    acquired = semaphore.acquire(timeout=queue_timeout("SCRAPE_QUEUE_TIMEOUT"))
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail="scrape pipeline is busy; retry after a short delay",
+        )
     try:
         logger.info(
             "scrape event=started request_id=%s queue_wait=%.2fs",
@@ -261,6 +431,8 @@ def run_scrape_url(
         )
         url = strip_tracking_query(url_value)
         validate_public_url(url)
+        if should_relay_scrape(url, relayed=relayed):
+            return relay_scrape_url(url, payload, request_id_value)
 
         rendered = payload.render == "always"
         try:
@@ -295,7 +467,10 @@ def run_scrape_url(
                     )
                 else:
                     raise
-            if payload.render == "auto" and (product_is_weak(result) or not product_has_dimensions(result)):
+            if payload.render == "auto" and (
+                product_is_weak(result)
+                or (retry_render_on_missing_dimensions and not product_has_dimensions(result))
+            ):
                 rendered = True
                 logger.info(
                     "scrape stage=extract_retry_render request_id=%s reason=weak_result images=%d has_dimensions=%s url=%s",
@@ -365,7 +540,12 @@ def run_scrape_url(
             public_result["image_links"] = extracted_image_links(result)
 
         result_path = job_dir / "product_extract.json"
-        result_path.write_text(json.dumps(public_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        stored_result = {
+            key: value
+            for key, value in public_result.items()
+            if not key.startswith("_")
+        }
+        result_path.write_text(json.dumps(stored_result, ensure_ascii=False, indent=2), encoding="utf-8")
         logger.info(
             "scrape event=done request_id=%s job_id=%s upload_images=%s image_links=%d elapsed=%.2fs",
             request_id_value,
@@ -384,8 +564,17 @@ def run_scrape(
     payload: ScrapeRequest,
     upload_images: bool = True,
     request_id_value: str | None = None,
+    relayed: bool = False,
+    retry_render_on_missing_dimensions: bool = True,
 ) -> tuple[dict, str, Path]:
-    return run_scrape_url(payload.product_urls()[0], payload, upload_images, request_id_value)
+    return run_scrape_url(
+        payload.product_urls()[0],
+        payload,
+        upload_images,
+        request_id_value,
+        relayed=relayed,
+        retry_render_on_missing_dimensions=retry_render_on_missing_dimensions,
+    )
 
 
 def run_batch(urls: list[str], worker: Callable[[int, str], Any], batch_id: str, endpoint: str) -> list[Any]:
@@ -473,16 +662,18 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/scrape", response_model=ScrapeResponse | ScrapeBatchResponse)
-def scrape_product(payload: ScrapeRequest) -> ScrapeResponse | ScrapeBatchResponse:
+def scrape_product(payload: ScrapeRequest, request: Request) -> ScrapeResponse | ScrapeBatchResponse:
     api_request_id = request_id("api-scrape")
+    relayed = is_relay_request(request)
     logger.info(
-        "api event=received request_id=%s endpoint=/api/scrape batch=%s urls=%d",
+        "api event=received request_id=%s endpoint=/api/scrape batch=%s urls=%d relayed=%s",
         api_request_id,
         payload.is_batch(),
         len(payload.product_urls()),
+        relayed,
     )
     if not payload.is_batch():
-        public_result, job_id, _ = run_scrape(payload, request_id_value=api_request_id)
+        public_result, job_id, _ = run_scrape(payload, request_id_value=api_request_id, relayed=relayed)
         logger.info("api event=done request_id=%s endpoint=/api/scrape job_id=%s", api_request_id, job_id)
         return ScrapeResponse(**public_result)
 
@@ -497,7 +688,7 @@ def scrape_product(payload: ScrapeRequest) -> ScrapeResponse | ScrapeBatchRespon
             url_log_value(url),
         )
         try:
-            public_result, job_id, _ = run_scrape_url(url, payload, request_id_value=item_request_id)
+            public_result, job_id, _ = run_scrape_url(url, payload, request_id_value=item_request_id, relayed=relayed)
             logger.info(
                 "batch event=item_done batch_id=%s request_id=%s endpoint=/api/scrape index=%d job_id=%s elapsed=%.2fs",
                 api_request_id,
@@ -706,13 +897,19 @@ def create_xianyu_product_copy(payload: XianyuCopyRequest) -> XianyuCopyResponse
                 url_log_value(url),
             )
             try:
-                public_result, job_id, job_dir = run_scrape_url(
-                    url,
-                    payload,
-                    upload_images=True,
-                    request_id_value=item_request_id,
-                )
-                result = create_xianyu_copy(public_result, job_id, job_dir, request_id_value=item_request_id)
+                slot = xianyu_semaphore()
+                acquire_pipeline_slot(slot, "XIANYU", item_request_id)
+                try:
+                    public_result, job_id, job_dir = run_scrape_url(
+                        url,
+                        payload,
+                        upload_images=True,
+                        request_id_value=item_request_id,
+                        retry_render_on_missing_dimensions=False,
+                    )
+                    result = create_xianyu_copy(public_result, job_id, job_dir, request_id_value=item_request_id)
+                finally:
+                    slot.release()
                 logger.info(
                     "batch event=item_done batch_id=%s request_id=%s endpoint=/api/xianyu/copy index=%d job_id=%s elapsed=%.2fs",
                     api_request_id,
@@ -759,9 +956,21 @@ def create_xianyu_product_copy(payload: XianyuCopyRequest) -> XianyuCopyResponse
         return XianyuCopyBatchResponse(results=results)
 
     started = time.monotonic()
-    public_result, job_id, job_dir = run_scrape(payload, upload_images=True, request_id_value=api_request_id)
     try:
-        result = create_xianyu_copy(public_result, job_id, job_dir, request_id_value=api_request_id)
+        slot = xianyu_semaphore()
+        acquire_pipeline_slot(slot, "XIANYU", api_request_id)
+        try:
+            public_result, job_id, job_dir = run_scrape(
+                payload,
+                upload_images=True,
+                request_id_value=api_request_id,
+                retry_render_on_missing_dimensions=False,
+            )
+            result = create_xianyu_copy(public_result, job_id, job_dir, request_id_value=api_request_id)
+        finally:
+            slot.release()
+    except HTTPException:
+        raise
     except XianyuPipelineError as exc:
         logger.exception(
             "api event=failed request_id=%s endpoint=/api/xianyu/copy job_id=%s elapsed=%.2fs",

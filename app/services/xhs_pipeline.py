@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,7 @@ from urllib.parse import quote, urlparse
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from app.services.extractor import contains_source_site_name
 from app.services.storage import USER_AGENT, upload_to_superbed
 
 
@@ -226,6 +228,95 @@ def product_text(product: dict[str, Any]) -> str:
             continue
         lines.append(f"{key_text}：{value_text}")
     return "\n".join(lines)
+
+
+def build_xhs_hashtag_line(category: str) -> str:
+    category = category.strip() or "品类"
+    tags = [
+        "中古家具",
+        "上海中古家具",
+        "广州中古家具",
+        "深圳中古家具",
+        "北京中古家具",
+        "室内设计师",
+        "装修",
+        category,
+        f"中古{category}",
+    ]
+    return " ".join(f"#{tag}[话题]#" for tag in tags)
+
+
+def extract_xhs_ai_category(content: str) -> tuple[str, str]:
+    category_match = re.search(r"(?m)^\s*品类\s*[:：]\s*(\S.*?)\s*$", content)
+    if not category_match:
+        raise XHSPipelineError("Ark responses did not include an AI-identified product category")
+    category = category_match.group(1).strip()
+    cleaned_content = f"{content[:category_match.start()]}{content[category_match.end():]}".strip()
+    return category, cleaned_content
+
+
+_XHS_TOPIC_TOKEN_RE = re.compile(r"#[^#\s\r\n]*\[话题\]#?")
+_XHS_TOPIC_PREFIX_RE = re.compile(r"^\s*(?:话题|标签|hashtags?|tags?)\s*[:：]?\s*", re.IGNORECASE)
+
+
+def _is_hashtag_line(line: str) -> bool:
+    topic_line = _XHS_TOPIC_PREFIX_RE.sub("", line.strip(), count=1)
+    tokens = [token for token in topic_line.split() if token]
+    return bool(tokens) and all(token.startswith("#") and token.endswith("#") for token in tokens)
+
+
+def _strip_xhs_topic_tokens(line: str) -> str:
+    had_topic_token = bool(_XHS_TOPIC_TOKEN_RE.search(line))
+    cleaned = _XHS_TOPIC_TOKEN_RE.sub("", line)
+    if had_topic_token:
+        cleaned = _XHS_TOPIC_PREFIX_RE.sub("", cleaned)
+        cleaned = re.sub(r"^[\s,，、|/]+|[\s,，、|/]+$", "", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def normalize_xhs_copy_content(content: str, category: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        if _is_hashtag_line(line):
+            continue
+        cleaned_line = _strip_xhs_topic_tokens(line)
+        if cleaned_line:
+            cleaned_lines.append(cleaned_line)
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+    body = "\n".join(cleaned_lines).rstrip()
+    hashtag_line = build_xhs_hashtag_line(category)
+    if body:
+        return f"{body}\n\n{hashtag_line}"
+    return hashtag_line
+
+
+def generated_xhs_copy_uses_source_site_as_creator(
+    title: str,
+    content: str,
+    product: dict[str, Any],
+) -> bool:
+    source_url = str(product.get("source_url") or "").strip()
+    if not source_url:
+        return False
+    output = f"{title}\n{content}"
+    if not contains_source_site_name(output, source_url):
+        return False
+    return bool(
+        re.search(
+            r"(?:制造商|生产|制作者|制作|设计师|设计|作者|艺术家|出品|"
+            r"manufacturer|made\s+by|designed\s+by|producer|creator|artist)",
+            output,
+            re.I,
+        )
+    )
 
 
 def is_noise_detail(value: str) -> bool:
@@ -823,7 +914,7 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
 - 正文段落之间都要空一行
 
 1、标题共20个字，前三个字为"旨丘｜"，后17个字请参考作品特色去描写，同时带出其品类。最特色卖点与品类之间以"·"隔开。标题不要出现"法式"这类国家+式的说法，不要出现"复古"，可用年代或中古代替。
-2、内容第一段写能获取到的基本信息，包括国家、年代、设计师、制造商、品类、材质与特征；没有的信息不要硬写。段首以"旨丘在售的这…"开始。
+2、内容第一段写能获取到的基本信息，包括国家、年代、设计师、制造商、品类、材质与特征；没有的信息不要硬写。制作者、设计师、制造商、艺术家只能使用商品名称、商品描述或商品详情中明确出现的作品资料；网站名、域名、画廊名、销售平台名、页面品牌名和链接地址都不是制作者证据，不能把它们写成“某某生产”“某某制造”“某某设计”。段首以"旨丘在售的这…"开始。
 3、内容第二段描写造型特点、使用场景和实用性，语言优美流畅，直击最突出的特点。
 4、内容第三段结合产品信息描写独特性和收藏性，以画廊专业角度去写。
 5、最后一段需严格按照以下格式：
@@ -839,7 +930,7 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
 📍广州｜广州市越秀区东山街道3号橄榄山
 6、整体文字必须参考所有产品信息来修改润色并扩充，不要遗漏信息，不要列序号。正文前三段共约250字，最后不要加无关文字。
 7、标题参考时尚编辑叙事角度，不要出现"收藏级"三字，可用"值得收藏"替代。
-8、在正文【藏品信息Information 】结束之后，再空一行，生成3-6个小红书话题标签。标签格式：#标签名[话题]#。必须包含：中古家具、空间美学、上海中古家具。根据品类生成"中古+品类名"标签，再生成1-2个特色标签。所有标签用空格隔开放在同一行。
+8、请先单独输出一行“品类：具体中文品类”，必须由你结合商品标题、页面文字和产品图片独立识别，不要套用固定分类表或关键词映射。先判断它是什么实际物件，再确定品类；雕塑、绘画、艺术品、陶艺、花器、摆件等应按真实类别识别，不能因为它出现在家具画廊、适合陈设或具有雕塑感就归为桌子、柜子或其他家具。例如“Abstract Terracotta Sculpture”必须输出“品类：雕塑”，而不是“家具”“摆件”或“桌子”。只输出简短中文品类，不要输出英文、判断过程或多个候选。程序会删除这一行，不要把它写进正文。正文【藏品信息Information 】结束之后，再空一行，生成9个小红书话题标签，顺序固定为：#中古家具[话题]# #上海中古家具[话题]# #广州中古家具[话题]# #深圳中古家具[话题]# #北京中古家具[话题]# #室内设计师[话题]# #装修[话题]# #品类[话题]# #中古品类[话题]#。最后两个标签中的“品类”替换为你识别出的具体品类，例如餐边柜，则写成#餐边柜[话题]# #中古餐边柜[话题]#。所有标签用空格隔开放在同一行。
 9、文案中只允许出现"旨丘"作为店铺/品牌名称，禁止出现其他任何店铺名、网站名、出品方名称。
 10、正文部分除产品名称外禁止出现不必要英文单词。"""
     user_prompt = f"这是产品的详细信息：\n{product_text(product)}\n\n请根据以上信息生成小红书标题和正文。"
@@ -887,13 +978,17 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
                 raise XHSPipelineError(f"Ark responses HTTP {response.status_code}: {response.text[:500]}")
             payload = response.json()
             content = extract_response_text(payload)
-            parts = [part.strip() for part in content.splitlines() if part.strip()]
+            category, content_without_category = extract_xhs_ai_category(content)
+            parts = [part.strip() for part in content_without_category.splitlines() if part.strip()]
             if not parts:
                 raise XHSPipelineError("Ark responses returned empty content")
             title = parts[0]
-            body = content[len(title) :].strip()
+            body = content_without_category[len(title) :].strip()
             if not body:
                 raise XHSPipelineError("Ark responses returned incomplete XHS copy")
+            body = normalize_xhs_copy_content(body, category)
+            if generated_xhs_copy_uses_source_site_as_creator(title, body, product):
+                raise XHSPipelineError("文案将来源网站名称误写为制作者")
             logger.info(
                 "xhs stage=generate_copy_attempt_done request_id=%s job_id=%s attempt=%d title=%r elapsed=%.2fs",
                 request_id_value,

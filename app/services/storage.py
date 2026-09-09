@@ -391,8 +391,10 @@ def download_images_with_shared_browser(urls: list[str], target_dir: Path) -> di
 def optimize_image_for_upload(path: Path, original_bytes: int) -> tuple[Path, int]:
     min_bytes = env_int("IMAGE_UPLOAD_OPTIMIZE_MIN_BYTES", DEFAULT_OPTIMIZE_MIN_BYTES)
     max_dimension = env_int("IMAGE_UPLOAD_MAX_DIMENSION", DEFAULT_OPTIMIZE_MAX_DIMENSION)
+    source_is_jpeg = path.suffix.lower() in {".jpg", ".jpeg"}
     if original_bytes < min_bytes:
-        return path, original_bytes
+        if source_is_jpeg:
+            return path, original_bytes
 
     try:
         image = Image.open(path)
@@ -411,11 +413,21 @@ def optimize_image_for_upload(path: Path, original_bytes: int) -> tuple[Path, in
         optimized_path = path.with_suffix(".optimized.jpg")
         image.save(optimized_path, "JPEG", quality=88, optimize=True, progressive=True)
         optimized_bytes = optimized_path.stat().st_size
-        if optimized_bytes < original_bytes:
+        if optimized_bytes < original_bytes or not source_is_jpeg:
             return optimized_path, optimized_bytes
     except Exception:
         logger.exception("image_upload event=optimize_failed path=%s", path)
     return path, original_bytes
+
+
+def model_image_data_url(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ImageHostingError(f"Cannot read normalized model image: {path}") from exc
+    if not data:
+        raise ImageHostingError(f"Normalized model image is empty: {path}")
+    return f"data:image/jpeg;base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def upload_to_superbed(path: Path, session: requests.Session) -> str:
@@ -491,6 +503,7 @@ def upload_one_image(
         with upload_semaphore():
             local_path, byte_count = download_image(source_url, temp_dir, session)
             upload_path, upload_byte_count = optimize_image_for_upload(local_path, byte_count)
+            item["_model_image_data_url"] = model_image_data_url(upload_path)
             hosted_url = upload_to_superbed(upload_path, session)
         item["hosted_url"] = hosted_url
         item["filename"] = upload_path.name
@@ -537,6 +550,7 @@ def upload_downloaded_image(
         )
         with upload_semaphore():
             upload_path, upload_byte_count = optimize_image_for_upload(local_path, byte_count)
+            item["_model_image_data_url"] = model_image_data_url(upload_path)
             hosted_url = upload_to_superbed(upload_path, session)
         item["hosted_url"] = hosted_url
         item["filename"] = upload_path.name

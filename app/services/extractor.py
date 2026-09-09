@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
@@ -54,6 +55,7 @@ HASH_PROJECT_ROUTE_DOMAINS = {"sauceldn.com"}
 ATKRIS_PRODUCT_IMAGE_DOMAINS = {"atkris.com"}
 FUNDAMENTE_DOMAINS = {"fundamente.nl"}
 SITONVINTAGE_DOMAINS = {"sitonvintage.com"}
+STUDIO_1_DOMAINS = {"studio-1.nl"}
 MORENTZ_DOMAINS = {"morentz.com"}
 HGALLERY_DOMAINS = {"hgallery.com"}
 OLD_BOY_DOMAINS = {"old-boy.be"}
@@ -206,6 +208,14 @@ def price_is_valid(value: Any) -> bool:
     return amount is not None and amount > 0
 
 
+def price_is_zero(value: Any) -> bool:
+    text = clean_price_text(value)
+    if not text or not re.search(r"\d", text):
+        return False
+    amount = price_amount(text)
+    return amount == 0
+
+
 def format_shopify_price(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -221,14 +231,553 @@ def clean_dimension_text(value: Any) -> str:
     if not text:
         return ""
     text = re.split(r"\bPrice\s*[:：]", text, maxsplit=1, flags=re.I)[0]
-    sentence_match = re.match(
-        r"^(.{0,220}\d.{0,220}?(?:cm|mm|in|inch|inches|m|″|”))\.\s+[A-ZÀ-Þ].*$",
+    has_multiple_dimension_sentences = bool(
+        re.search(
+            r"\b(?:Width|Depth|Height|Length|Diameter)\b[^.]*\.\s*\b(?:Width|Depth|Height|Length|Diameter)\b",
+            text,
+            re.I,
+        )
+    )
+    if not has_multiple_dimension_sentences:
+        sentence_match = re.match(
+            r"^(.{0,220}\d.{0,220}?(?:cm|mm|in|inch|inches|m|″|”))\.\s+[A-ZÀ-Þ].*$",
+            text,
+            re.I,
+        )
+        if sentence_match:
+            text = sentence_match.group(1)
+    return clean_text(text).strip(" .;:-")
+
+
+def format_dimension_cm(value: str, unit: str = "m") -> str:
+    normalized_unit = clean_text(unit).lower()
+    multiplier = {
+        "m": Decimal("100"),
+        "cm": Decimal("1"),
+        "mm": Decimal("0.1"),
+        "in": Decimal("2.54"),
+        "inch": Decimal("2.54"),
+        "inches": Decimal("2.54"),
+        '"': Decimal("2.54"),
+        "″": Decimal("2.54"),
+        "”": Decimal("2.54"),
+    }.get(normalized_unit)
+    if multiplier is None:
+        return ""
+
+    text_value = clean_text(value).replace(",", ".")
+    alternative_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", text_value)
+    if alternative_match:
+        numerator = Decimal(alternative_match.group(1))
+        denominator = Decimal(alternative_match.group(2))
+        is_fractional_inches = (
+            normalized_unit in {"in", "inch", "inches", '"', "″", "”"}
+            and numerator < denominator
+            and denominator in {Decimal("2"), Decimal("4"), Decimal("8"), Decimal("16"), Decimal("32"), Decimal("64")}
+        )
+        if not is_fractional_inches:
+            converted_values = []
+            for raw_amount in (numerator, denominator):
+                converted = (raw_amount * multiplier).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                text = format(converted.normalize(), "f")
+                converted_values.append(text.rstrip("0").rstrip(".") if "." in text else text)
+            return "/".join(converted_values)
+
+    amount = parse_measurement_amount(value)
+    if amount is None:
+        return ""
+    converted = (amount * multiplier).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    text = format(converted.normalize(), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def parse_measurement_amount(value: Any) -> Decimal | None:
+    text = clean_text(value).replace(",", ".")
+    if not text:
+        return None
+    fraction_match = re.fullmatch(r"(?:(\d+)\s+)?(\d+)\s*/\s*(\d+)", text)
+    if fraction_match:
+        whole = Decimal(fraction_match.group(1) or "0")
+        numerator = Decimal(fraction_match.group(2))
+        denominator = Decimal(fraction_match.group(3))
+        if denominator == 0 or denominator > 64 or numerator >= denominator:
+            return None
+        return whole + (numerator / denominator)
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
+DIMENSION_LABEL_ORDER = {
+    "W": 0,
+    "D": 1,
+    "H": 2,
+    "L": 3,
+    "Seat Height": 4,
+    "Seat Depth": 5,
+    "AH": 6,
+    "Diameter": 7,
+}
+
+DIMENSION_LABEL_ALIASES = {
+    "w": "W",
+    "width": "W",
+    "wide": "W",
+    "d": "D",
+    "depth": "D",
+    "deep": "D",
+    "h": "H",
+    "height": "H",
+    "high": "H",
+    "tall": "H",
+    "haut": "H",
+    "hauteur": "H",
+    "alto": "H",
+    "altura": "H",
+    "l": "L",
+    "length": "L",
+    "larg": "W",
+    "largeur": "W",
+    "ancho": "W",
+    "largura": "W",
+    "prof": "D",
+    "profondeur": "D",
+    "profundidad": "D",
+    "profunidad": "D",
+    "sh": "Seat Height",
+    "s height": "Seat Height",
+    "seat height": "Seat Height",
+    "seatheight": "Seat Height",
+    "altura do assento": "Seat Height",
+    "seat depth": "Seat Depth",
+    "seatdepth": "Seat Depth",
+    "ah": "AH",
+    "dia": "Diameter",
+    "diameter": "Diameter",
+    "durchmesser": "Diameter",
+    "ø": "Diameter",
+}
+
+DIMENSION_VALUE_PATTERN = r"\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?(?:\s+\d+\s*/\s*\d+)?|\d+\s*/\s*\d+"
+DIMENSION_VALUE_TOKEN = rf"(?:{DIMENSION_VALUE_PATTERN})"
+DIMENSION_UNIT_PATTERN = r"(?:cm|mm|m|in(?:ch(?:es)?)?|[\"″”])"
+DIMENSION_UNIT_BOUNDARY = r"(?=\W|$)"
+DIMENSION_LABEL_PATTERN = (
+    r"(?:Altura\s+do\s+Assento|Seat\s+Height|Seat\s+Depth|S\.\s*Height|SeatHeight|SeatDepth|"
+    r"Profondeur|Profundidad|Profunidad|Durchmesser|Diameter|Hauteur|Largeur|"
+    r"Largura|Width|Depth|Height|Length|Wide|High|Deep|Tall|Haut|Alto|Altura|"
+    r"Larg|Ancho|Prof|Dia|W|D|H|L|SH|AH|ø)"
+)
+
+
+def canonical_dimension_label(value: Any) -> str:
+    raw = clean_text(value).lower()
+    if raw == "ø":
+        return "Diameter"
+    normalized = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    return DIMENSION_LABEL_ALIASES.get(normalized) or DIMENSION_LABEL_ALIASES.get(normalized.replace(" ", ""), "")
+
+
+def has_explicit_dimension_unit(value: str) -> bool:
+    return bool(re.search(rf"\d\s*(?:{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}", value, re.I))
+
+
+def normalize_dimension_text_to_cm(value: Any) -> str:
+    text = clean_dimension_text(value)
+    if not text:
+        return ""
+
+    parts: dict[str, str] = {}
+    spans: list[tuple[int, int]] = []
+
+    def add_part(label_value: Any, number_value: Any, unit_value: Any, span: tuple[int, int] | None = None) -> None:
+        if span and any(not (span[1] <= start or span[0] >= end) for start, end in spans):
+            return
+        label = canonical_dimension_label(label_value)
+        if not label or label in parts:
+            return
+        converted = format_dimension_cm(str(number_value), str(unit_value))
+        if converted:
+            parts[label] = f"{converted} cm"
+            if span:
+                spans.append(span)
+
+    def add_unitless_dimension_sequence(matches: list[re.Match[str]]) -> None:
+        if len(matches) < 2:
+            return
+        remainder = text
+        for match in reversed(matches):
+            start, end = match.span()
+            remainder = f"{remainder[:start]} {remainder[end:]}"
+        remainder = re.sub(
+            r"\b(?:Dimensions?|Measurements?|Measurement|Size|Sizes|Dimens[aã]o|Medidas|Afmetingen|Größe)\b",
+            " ",
+            remainder,
+            flags=re.I,
+        )
+        remainder = re.sub(r"[\s:;,\-–—|/·•x×()]+", "", remainder)
+        if remainder:
+            return
+        for match in matches:
+            add_part(match.group("label"), match.group("value"), "cm", match.span())
+
+    unitless_value_label_matches = list(
+        re.finditer(
+            rf"(?P<value>{DIMENSION_VALUE_PATTERN})\s*"
+            rf"(?P<label>Width|Depth|Height|Length|Diameter|Wide|Deep|High|Tall|W|D|H|L)\b(?!\s*[:=])",
+            text,
+            re.I,
+        )
+    )
+    add_unitless_dimension_sequence(unitless_value_label_matches)
+
+    unitless_label_value_matches = list(
+        re.finditer(
+            rf"(?<![A-Za-zÀ-ÿ])(?P<label>Width|Depth|Height|Length|Diameter|Wide|Deep|High|Tall|W|D|H|L)"
+            rf"\.?\s*[:=]?\s*(?P<value>{DIMENSION_VALUE_PATTERN})",
+            text,
+            re.I,
+        )
+    )
+    add_unitless_dimension_sequence(unitless_label_value_matches)
+
+    sequence_with_order = re.search(
+        rf"(?P<values>{DIMENSION_VALUE_TOKEN}(?:\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}){{1,3}})"
+        rf"\s*(?P<unit>{DIMENSION_UNIT_PATTERN})\s*"
+        rf"\((?P<labels>{DIMENSION_LABEL_PATTERN}(?:\s*(?:x|×)\s*{DIMENSION_LABEL_PATTERN}){{1,3}})\)",
         text,
         re.I,
     )
-    if sentence_match:
-        text = sentence_match.group(1)
-    return clean_text(text).strip(" .;:-")
+    if sequence_with_order:
+        values = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", sequence_with_order.group("values"))
+            if clean_text(item)
+        ]
+        labels = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", sequence_with_order.group("labels"))
+            if clean_text(item)
+        ]
+        if len(values) == len(labels):
+            for label, number in zip(labels, values):
+                add_part(label, number, sequence_with_order.group("unit"))
+            spans.append(sequence_with_order.span())
+
+    compact_order = re.search(
+        rf"\b(?P<labels>[WDHL]{{2,4}})\s*"
+        rf"(?P<values>{DIMENSION_VALUE_TOKEN}(?:\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}){{1,3}})"
+        rf"\s*(?P<unit>{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}",
+        text,
+        re.I,
+    )
+    if compact_order:
+        values = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", compact_order.group("values"))
+            if clean_text(item)
+        ]
+        labels = list(compact_order.group("labels"))
+        if len(values) == len(labels):
+            for label, number in zip(labels, values):
+                add_part(label, number, compact_order.group("unit"))
+            spans.append(compact_order.span())
+
+    leading_hwd_sequence = re.search(
+        rf"\b(?P<label>H|Height)\.?\s*"
+        rf"(?P<values>{DIMENSION_VALUE_TOKEN}\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN})"
+        rf"\s*(?P<unit>{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}",
+        text,
+        re.I,
+    )
+    if leading_hwd_sequence:
+        values = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", leading_hwd_sequence.group("values"))
+            if clean_text(item)
+        ]
+        for label, number in zip(("H", "W", "D"), values):
+            add_part(label, number, leading_hwd_sequence.group("unit"))
+        spans.append(leading_hwd_sequence.span())
+
+    shared_unit = ""
+    shared_unit_match = re.search(
+        r"(?P<unit>cm|mm|m|inch(?:es)?|[\"″”])\b(?!.*(?:cm|mm|m|inch(?:es)?|[\"″”])\b)",
+        text,
+        re.I,
+    )
+    if shared_unit_match:
+        shared_unit = shared_unit_match.group("unit")
+    labeled_shared_unit_matches = list(
+        re.finditer(
+            rf"(?<![A-Za-zÀ-ÿ])(?P<label>{DIMENSION_LABEL_PATTERN})\.?\s*[:=]?\s*"
+            rf"(?P<value>{DIMENSION_VALUE_PATTERN})\s*(?P<unit>{DIMENSION_UNIT_PATTERN})?",
+            text,
+            re.I,
+        )
+    )
+    shared_labels = {
+        canonical_dimension_label(match.group("label"))
+        for match in labeled_shared_unit_matches
+        if canonical_dimension_label(match.group("label"))
+    }
+    if shared_unit and len(shared_labels) >= 2:
+        for match in labeled_shared_unit_matches:
+            add_part(match.group("label"), match.group("value"), match.group("unit") or shared_unit)
+
+    unit_per_value_sequence = re.search(
+        rf"(?P<items>{DIMENSION_VALUE_TOKEN}\s*{DIMENSION_UNIT_PATTERN}"
+        rf"(?:\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}\s*{DIMENSION_UNIT_PATTERN}){{1,2}})",
+        text,
+        re.I,
+    )
+    if unit_per_value_sequence and not any(
+        start < unit_per_value_sequence.end() and end > unit_per_value_sequence.start()
+        for start, end in spans
+    ):
+        tokens = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", unit_per_value_sequence.group("items"))
+            if clean_text(item)
+        ]
+        parsed_tokens: list[tuple[str, str]] = []
+        for token in tokens:
+            token_match = re.fullmatch(
+                rf"(?P<value>{DIMENSION_VALUE_PATTERN})\s*(?P<unit>{DIMENSION_UNIT_PATTERN})",
+                token,
+                re.I,
+            )
+            if not token_match:
+                parsed_tokens = []
+                break
+            parsed_tokens.append((token_match.group("value"), token_match.group("unit")))
+        prefix_context = bool(
+            re.search(r"\b(?:Dimensions?|Measurements?|Measurement|Size|Visible\s+size|Dimens[aã]o|Medidas|Afmetingen)\b", text, re.I)
+        )
+        pure_sequence = clean_text(unit_per_value_sequence.group(0)) == text
+        if len(parsed_tokens) == 2 and (prefix_context or pure_sequence):
+            for label, (number, unit) in zip(("W", "H"), parsed_tokens):
+                add_part(label, number, unit)
+            spans.append(unit_per_value_sequence.span())
+        elif len(parsed_tokens) == 3 and (prefix_context or pure_sequence):
+            for label, (number, unit) in zip(("W", "D", "H"), parsed_tokens):
+                add_part(label, number, unit)
+            spans.append(unit_per_value_sequence.span())
+
+    component_sequence = re.search(
+        rf"\b(?P<items>(?:[WDHL]\.?\s*{DIMENSION_VALUE_TOKEN}|{DIMENSION_VALUE_TOKEN}\s*[WDHL]|{DIMENSION_VALUE_TOKEN})"
+        rf"(?:\s*(?:x|×)\s*(?:[WDHL]\.?\s*{DIMENSION_VALUE_TOKEN}|{DIMENSION_VALUE_TOKEN}\s*[WDHL]|{DIMENSION_VALUE_TOKEN})){{1,3}})"
+        rf"\s*(?P<unit>{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}",
+        text,
+        re.I,
+    )
+    if component_sequence and not any(
+        start < component_sequence.end() and end > component_sequence.start()
+        for start, end in spans
+    ):
+        tokens = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", component_sequence.group("items"))
+            if clean_text(item)
+        ]
+        parsed_tokens: list[tuple[str, str]] = []
+        for token in tokens:
+            token_match = re.fullmatch(
+                rf"(?:(?P<prefix>[WDHL])\.?\s*)?(?P<value>{DIMENSION_VALUE_PATTERN})\s*(?P<suffix>[WDHL])?",
+                token,
+                re.I,
+            )
+            if not token_match:
+                parsed_tokens = []
+                break
+            label = clean_text(token_match.group("prefix") or token_match.group("suffix")).upper()
+            parsed_tokens.append((label, token_match.group("value")))
+        labels_present = {label for label, _ in parsed_tokens if label}
+        if len(parsed_tokens) in {2, 3, 4}:
+            default_labels = ("W", "H") if len(parsed_tokens) == 2 else ("W", "D", "H", "L")
+            missing_defaults = [label for label in default_labels if label not in labels_present]
+            for label, number in parsed_tokens:
+                resolved_label = label or (missing_defaults.pop(0) if missing_defaults else "")
+                add_part(resolved_label, number, component_sequence.group("unit"))
+            spans.append(component_sequence.span())
+
+    unlabeled_sequence = re.search(
+        rf"(?P<prefix>\b(?:Dimensions?|Measurements?|Measurement|Size|Visible\s+size|Dimens[aã]o|Medidas|Afmetingen)\b\s*[:：]?\s*)?"
+        rf"(?P<values>{DIMENSION_VALUE_TOKEN}(?:\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}){{1,2}})"
+        rf"\s*(?P<unit>{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}",
+        text,
+        re.I,
+    )
+    if unlabeled_sequence and not any(
+        start < unlabeled_sequence.end() and end > unlabeled_sequence.start()
+        for start, end in spans
+    ):
+        values = [
+            clean_text(item)
+            for item in re.split(r"\s*(?:x|×)\s*", unlabeled_sequence.group("values"))
+            if clean_text(item)
+        ]
+        sequence_text = clean_text(unlabeled_sequence.group(0))
+        pure_sequence = bool(
+            re.fullmatch(
+                rf"(?:Dimensions?|Measurements?|Measurement|Size|Visible\s+size|Dimens[aã]o|Medidas|Afmetingen)?\s*[:：]?\s*"
+                rf"{DIMENSION_VALUE_TOKEN}(?:\s*(?:x|×)\s*{DIMENSION_VALUE_TOKEN}){{1,2}}\s*{DIMENSION_UNIT_PATTERN}",
+                sequence_text,
+                re.I,
+            )
+        )
+        if len(values) == 2 and (unlabeled_sequence.group("prefix") or pure_sequence):
+            for label, number in zip(("W", "H"), values):
+                add_part(label, number, unlabeled_sequence.group("unit"))
+            spans.append(unlabeled_sequence.span())
+        elif len(values) == 3 and (unlabeled_sequence.group("prefix") or pure_sequence):
+            for label, number in zip(("W", "D", "H"), values):
+                add_part(label, number, unlabeled_sequence.group("unit"))
+            spans.append(unlabeled_sequence.span())
+
+    context_unit = ""
+    context_unit_match = re.search(
+        r"(?:Dimensions?|Measurements?|Measurement|Size|Sizes|Dimens[aã]o|Medidas|Afmetingen|Größe)\s*(?:\(\s*)?(?P<unit>cm|mm|m|in(?:ch(?:es)?)?)\b",
+        text,
+        re.I,
+    )
+    if context_unit_match:
+        context_unit = context_unit_match.group("unit")
+    patterns = (
+        re.compile(
+            rf"(?<![A-Za-zÀ-ÿ])(?P<label>{DIMENSION_LABEL_PATTERN})\s*[:=.\-]?\s*"
+            rf"(?:approx(?:imately)?\.?\s*)?"
+            rf"(?P<value>{DIMENSION_VALUE_PATTERN})\s*(?P<unit>{DIMENSION_UNIT_PATTERN}){DIMENSION_UNIT_BOUNDARY}",
+            re.I,
+        ),
+        re.compile(
+            rf"(?P<value>{DIMENSION_VALUE_PATTERN})\s*(?P<unit>{DIMENSION_UNIT_PATTERN})\s*"
+            rf"\(?(?P<label>{DIMENSION_LABEL_PATTERN})\)?(?=\W|$)",
+            re.I,
+        ),
+    )
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            span = match.span()
+            add_part(match.group("label"), match.group("value"), match.group("unit"), span)
+
+    if context_unit:
+        unitless_pattern = re.compile(
+            rf"(?<![A-Za-zÀ-ÿ])(?P<label>{DIMENSION_LABEL_PATTERN})\s*[:=.\-]?\s*"
+            rf"(?:approx(?:imately)?\.?\s*)?"
+            rf"(?P<value>{DIMENSION_VALUE_PATTERN})(?=\s*(?:{DIMENSION_LABEL_PATTERN}|Condition|$))",
+            re.I,
+        )
+        for match in unitless_pattern.finditer(text):
+            span = match.span()
+            add_part(match.group("label"), match.group("value"), context_unit, span)
+
+    if not parts:
+        return text
+
+    ordered_labels = sorted(parts, key=lambda label: DIMENSION_LABEL_ORDER.get(label, 100))
+    return "; ".join(f"{label}: {parts[label]}" for label in ordered_labels)
+
+
+def normalize_studio_1_dimensions(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    matches = re.findall(
+        r"\b(w|d|h|length(?:\s+shade)?)\s*[:=]\s*([0-9]+(?:[.,][0-9]+)?)\s*(m|cm|mm)?\b",
+        text,
+        re.I,
+    )
+    if not matches:
+        return ""
+    parts = []
+    for label, number, unit in matches:
+        converted = format_dimension_cm(number, unit or "m")
+        if converted:
+            normalized_label = "L" if label.lower().startswith("length") else label.upper()
+            parts.append(f"{normalized_label}: {converted} cm")
+    return "; ".join(parts)
+
+
+def extract_studio_1_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
+    heading = soup.find("h1")
+    if heading is None:
+        for strong in soup.find_all("strong"):
+            text = clean_text(strong.get_text(" "))
+            if text and len(text) > 8:
+                heading = strong
+                break
+    name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
+    if not name:
+        name = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    if not name:
+        return {}
+
+    info: dict[str, Any] = {
+        "source": "studio-1-product-page",
+        "url": base_url,
+        "name": name,
+    }
+    for heading_node in soup.find_all(["h2", "h3", "p", "div"]):
+        text = clean_text(heading_node.get_text(" "))
+        if len(text) > 120:
+            continue
+        match = re.search(
+            r"\bprice\b\s*[:：]?\s*((?:[€£$]\s*)?\d[\d\s.,]*)(?:\s*(?:EUR|USD|GBP))?\s*[,.-]*$",
+            text,
+            re.I,
+        )
+        if not match:
+            continue
+        price = clean_price_text(match.group(1)).rstrip(",-. ")
+        if price:
+            info["price"] = price
+            if "€" in price:
+                info["currency"] = "EUR"
+            elif "£" in price:
+                info["currency"] = "GBP"
+            elif "$" in price:
+                info["currency"] = "USD"
+            break
+
+    details: dict[str, Any] = {}
+    for item in soup.select(".el-item"):
+        label_node = item.select_one(".el-title")
+        value_node = item.select_one(".el-content")
+        if label_node is None or value_node is None:
+            continue
+        label = clean_text(label_node.get_text(" ")).strip(":： ")
+        value = clean_text(value_node.get_text(" "))
+        if not label or not value:
+            continue
+        detail_key = normalize_detail_label(label)
+        if detail_key == "dimensions":
+            dimensions = normalize_studio_1_dimensions(value)
+            if dimensions:
+                details[detail_key] = dimensions
+                info["dimensions"] = dimensions
+        else:
+            details[detail_key] = value
+    for row in soup.find_all("tr"):
+        cells = [clean_text(cell.get_text(" ")) for cell in row.find_all(["th", "td"])]
+        cells = [cell for cell in cells if cell and cell != "\xa0"]
+        if len(cells) < 2:
+            continue
+        label = cells[0].strip(":： ")
+        value = cells[-1]
+        detail_key = normalize_detail_label(label)
+        if detail_key == "dimensions":
+            dimensions = normalize_studio_1_dimensions(value)
+            if dimensions:
+                details[detail_key] = dimensions
+                info["dimensions"] = dimensions
+        elif detail_key and value:
+            details.setdefault(detail_key, value)
+    if details:
+        info["details"] = details
+    return info
 
 
 def is_next_image_proxy_path(path: str) -> bool:
@@ -324,6 +873,102 @@ def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandi
 def normalized_hostname(url: str) -> str:
     hostname = (urlparse(url).hostname or "").lower()
     return hostname[4:] if hostname.startswith("www.") else hostname
+
+
+def _compact_identity_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_text(value).lower())
+
+
+def source_site_aliases(url: str) -> set[str]:
+    hostname = normalized_hostname(url)
+    if not hostname:
+        return set()
+    first_label = hostname.split(".", 1)[0]
+    aliases = {
+        hostname,
+        hostname.replace("-", " "),
+        first_label,
+        first_label.replace("-", " "),
+    }
+    generic_aliases = {
+        "antique",
+        "antiques",
+        "art",
+        "collection",
+        "design",
+        "furniture",
+        "gallery",
+        "home",
+        "shop",
+        "store",
+        "studio",
+        "vintage",
+    }
+    return {
+        alias
+        for alias in aliases
+        if len(_compact_identity_text(alias)) >= 4
+        and _compact_identity_text(alias) not in generic_aliases
+    }
+
+
+def contains_source_site_name(value: Any, source_url: str) -> bool:
+    compact_value = _compact_identity_text(value)
+    if not compact_value:
+        return False
+    return any(
+        _compact_identity_text(alias) in compact_value
+        for alias in source_site_aliases(source_url)
+    )
+
+
+def strip_source_site_suffix(title: str, source_url: str) -> str:
+    cleaned = clean_product_title(title)
+    separators = (" | ", " — ", " – ", " - ")
+    for separator in separators:
+        parts = [part.strip() for part in cleaned.split(separator) if part.strip()]
+        if len(parts) >= 2 and contains_source_site_name(parts[-1], source_url):
+            return clean_text(separator.join(parts[:-1]))
+    return cleaned
+
+
+CREATOR_DETAIL_KEYS = {
+    "artist",
+    "author",
+    "brand",
+    "creator",
+    "designedby",
+    "designer",
+    "maker",
+    "manufacturer",
+    "producedby",
+    "producer",
+}
+
+
+def sanitize_source_creator_details(details: dict[str, Any], source_url: str) -> dict[str, Any]:
+    sanitized = {}
+    for key, value in details.items():
+        compact_key = re.sub(r"[\s_.-]+", "", str(key).lower())
+        if compact_key in CREATOR_DETAIL_KEYS and contains_source_site_name(value, source_url):
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
+def sanitize_source_product_info(info: dict[str, Any], source_url: str) -> dict[str, Any]:
+    sanitized = dict(info)
+    if sanitized.get("name"):
+        sanitized["name"] = strip_source_site_suffix(str(sanitized["name"]), source_url)
+    details = sanitized.get("details")
+    if isinstance(details, dict):
+        sanitized["details"] = sanitize_source_creator_details(details, source_url)
+        if not sanitized["details"]:
+            sanitized.pop("details", None)
+    for key in ("brand", "designer", "manufacturer", "creator", "producer", "maker"):
+        if key in sanitized and contains_source_site_name(sanitized[key], source_url):
+            sanitized.pop(key, None)
+    return sanitized
 
 
 def resolve_hash_project_url(url: str) -> str:
@@ -1054,7 +1699,7 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                 }
             price, currency = extract_offer_price(offer0)
             current = {
-                "name": clean_product_title(clean_text(item.get("name"))),
+                "name": strip_source_site_suffix(clean_text(item.get("name")), base_url),
                 "description": clean_text(item.get("description")),
                 "sku": clean_text(item.get("sku") or item.get("mpn")),
                 "brand": clean_text(brand),
@@ -1081,8 +1726,10 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
                 },
             )
             details.update(details_from_property_values(item.get("additionalProperty")))
+            details = sanitize_source_creator_details(details, base_url)
             if details:
                 current["details"] = details
+            current = sanitize_source_product_info(current, base_url)
             add_synthesized_dimensions(current)
             product_info = merge_product_info(product_info, current)
             product_images.extend(extract_image_urls(item.get("image"), base_url))
@@ -1092,6 +1739,7 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
 def normalize_detail_label(label: str) -> str:
     normalized = clean_text(label).strip(":").strip()
     lower = normalized.lower()
+    compact = re.sub(r"[\s_.-]+", "", lower)
     canonical_labels = {
         "place of origin": "Place of Origin",
         "country of origin": "Place of Origin",
@@ -1118,6 +1766,19 @@ def normalize_detail_label(label: str) -> str:
     }
     if lower in canonical_labels:
         return canonical_labels[lower]
+    compact_canonical_labels = {
+        "placeoforigin": "Place of Origin",
+        "countryoforigin": "Place of Origin",
+        "countryofmanufacture": "Place of Origin",
+        "landvanherkomst": "Place of Origin",
+        "origincountry": "Place of Origin",
+        "productioncountry": "Place of Origin",
+        "madein": "Place of Origin",
+        "origin": "Origin",
+        "country": "Country",
+    }
+    if compact in compact_canonical_labels:
+        return compact_canonical_labels[compact]
     if lower in {
         "dimensions",
         "dimension",
@@ -1126,6 +1787,8 @@ def normalize_detail_label(label: str) -> str:
         "size",
         "sizes",
     }:
+        return "dimensions"
+    if re.match(r"^(?:dimensions?|measurements?|size|sizes)\b", lower):
         return "dimensions"
     if lower in {"sku", "stock keeping unit"}:
         return "sku"
@@ -1142,8 +1805,14 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
                 return clean_text(tag["content"])
         return ""
 
-    title = clean_product_title(meta("og:title", "twitter:title") or clean_text(soup.title.string if soup.title else ""))
-    fallback_title = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    title = strip_source_site_suffix(
+        meta("og:title", "twitter:title") or clean_text(soup.title.string if soup.title else ""),
+        base_url,
+    )
+    fallback_title = strip_source_site_suffix(
+        clean_text(soup.title.string if soup.title else ""),
+        base_url,
+    )
     if is_weak_existing_name(title) and fallback_title:
         title = fallback_title
     description = meta("og:description", "description", "twitter:description")
@@ -1198,7 +1867,7 @@ def extract_nextjs_product_info(soup: BeautifulSoup) -> dict[str, Any]:
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     return info
 
 
@@ -1208,9 +1877,12 @@ def line_looks_like_dimensions(line: str) -> bool:
         return False
     if re.search(r"(http|copyright|cookie|newsletter|shipping|delivery|email|vat)", line, re.I):
         return False
-    has_unit = bool(re.search(r"(?:cm|mm|in|inch|inches|m)\b|″|”", line, re.I))
+    has_unit = bool(re.search(r"(?:cm|mm|in|inch|inches|m)\b|[\"″”]", line, re.I))
     if not has_unit:
         return False
+    normalized = normalize_dimension_text_to_cm(line)
+    if normalized and normalized != line:
+        return True
     return bool(
         re.search(
             r"\b(?:W|D|H|L|SH|AH|Dia|Diameter|Height|Width|Depth|Length|Seat\s+height)\.?\s*[:=\-]?\s*\d",
@@ -1218,12 +1890,12 @@ def line_looks_like_dimensions(line: str) -> bool:
             re.I,
         )
         or re.search(
-            r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m)?\s*(?:x|×)\s*"
-            r"\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|in|inch|inches|m))?",
+            r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m|[\"″”])?\s*(?:x|×)\s*"
+            r"\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|in|inch|inches|m|[\"″”]))?",
             line,
             re.I,
         )
-        or re.search(r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m)\s*\([hwdbl]\)", line, re.I)
+        or re.search(r"\d+(?:[.,]\d+)?\s*(?:cm|mm|in|inch|inches|m|[\"″”])\s*\([hwdbl]\)", line, re.I)
     )
 
 
@@ -1245,6 +1917,11 @@ def extract_dimensions_from_text(text: str) -> str:
     text = clean_text(text)
     if not text:
         return ""
+    normalized = normalize_dimension_text_to_cm(text)
+    if normalized and normalized != text and re.search(
+        r"\b(?:W|D|H|L|Seat Height|Seat Depth|AH|Diameter):\s*\d", normalized
+    ):
+        return normalized
     measurement_in_cm = re.search(
         r"\b(?:Measurements?\s+)?in\s+cm\s+"
         r"\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?h?\b",
@@ -1252,7 +1929,7 @@ def extract_dimensions_from_text(text: str) -> str:
         re.I,
     )
     if measurement_in_cm:
-        return clean_text(measurement_in_cm.group(0))
+        return normalize_dimension_text_to_cm(measurement_in_cm.group(0))
     labeled = re.search(
         r"(Dimensions?|Measurements?|Size)\s*[;:,-]?\s*"
         r"(.{0,180}?\d(?:[^.!?;]|[x×;,-]){0,180}?(?:cm|mm|in|inch|inches|″|”))",
@@ -1262,12 +1939,12 @@ def extract_dimensions_from_text(text: str) -> str:
     if labeled:
         candidate = clean_dimension_text(labeled.group(2))
         if line_looks_like_dimensions(candidate):
-            return candidate
+            return normalize_dimension_text_to_cm(candidate)
 
     sentence_candidates = re.split(r"(?<=[.!?])\s+", text)
     for sentence in sentence_candidates:
         if line_looks_like_dimensions(sentence):
-            return clean_dimension_text(sentence)
+            return normalize_dimension_text_to_cm(sentence)
     return ""
 
 
@@ -1275,23 +1952,79 @@ def extract_dimensions_from_lines(lines: list[str]) -> str:
     groups: list[list[str]] = []
     current: list[str] = []
     previous_was_label = False
+    previous_label_unit = ""
+    pending_dimension_label = ""
+    pending_dimension_prefix = ""
+    stop_markers = re.compile(
+        r"^(Related products?|Recommended products?|You may also like|Similar products?|"
+        r"Ähnliche Produkte|Prodotti correlati|Gerelateerde producten|"
+        r"Autres produits|Productos relacionados|Alternative vorschläge|Andere Kunden haben gesucht)\b",
+        re.I,
+    )
     for line in lines:
         normalized = clean_text(line)
         if not normalized:
             continue
-        label_only = bool(re.match(r"^(Dimensions?|Measurements?|Measurement|Size|Sizes)\s*:?\s*$", normalized, re.I))
-        same_line = re.match(r"^(Dimensions?|Measurements?|Measurement|Size|Sizes)\s*[;:]\s*(.+)$", normalized, re.I)
-        value = clean_dimension_text(same_line.group(2)) if same_line else clean_dimension_text(normalized)
+        if stop_markers.match(normalized):
+            break
+        if pending_dimension_prefix and re.match(r"^\d", normalized):
+            normalized = f"{pending_dimension_prefix}{normalized}"
+            pending_dimension_prefix = ""
+        if pending_dimension_label and has_explicit_dimension_unit(normalized):
+            inherited = normalize_dimension_text_to_cm(f"{pending_dimension_label}: {normalized}")
+            if inherited:
+                current.append(inherited)
+                pending_dimension_label = ""
+                previous_was_label = False
+                previous_label_unit = ""
+                continue
+        label_as_line = canonical_dimension_label(normalized)
+        if label_as_line and normalized.lower() not in {"size"}:
+            pending_dimension_label = label_as_line
+            continue
+        dimension_header = (
+            r"(?:Dimensions?|Measurements?|Measurement|Size|Sizes|Dimens[aã]o|Medidas|Afmetingen|Größe)"
+            r"(?:\s+(?:including|incl\.?|without|with)\s+[A-Za-z ]{1,40})?"
+            r"(?:\s*\([^)]+\))?"
+        )
+        label_match = re.match(rf"^{dimension_header}\s*:?\s*$", normalized, re.I)
+        label_only = bool(label_match)
+        if label_only:
+            unit_match = re.search(r"\((cm|mm|m|in(?:ch(?:es)?)?)\)", normalized, re.I)
+            previous_label_unit = unit_match.group(1) if unit_match else ""
+        same_line = re.match(rf"^{dimension_header}\s*[;:：]\s*(.+)$", normalized, re.I)
+        value = clean_dimension_text(same_line.group(1)) if same_line else clean_dimension_text(normalized)
+        if same_line and re.fullmatch(r"\d+", value):
+            pending_dimension_prefix = value
+            previous_was_label = True
+            previous_label_unit = ""
+            pending_dimension_label = ""
+            continue
+        if previous_was_label and not has_explicit_dimension_unit(value):
+            inherited = normalize_dimension_text_to_cm(value)
+            if inherited and inherited != value:
+                current.append(inherited)
+                previous_was_label = False
+                previous_label_unit = ""
+                continue
+        if previous_was_label and previous_label_unit and not has_explicit_dimension_unit(value):
+            inherited = normalize_dimension_text_to_cm(f"{value} {previous_label_unit}")
+            if inherited:
+                current.append(inherited)
+                previous_was_label = False
+                previous_label_unit = ""
+                continue
         looks_like = line_looks_like_dimensions(value)
         if same_line and looks_like:
             groups.append([value])
             current = []
             previous_was_label = False
+            previous_label_unit = ""
             continue
         if looks_like and (
             previous_was_label
             or re.match(
-                r"^[•\-–]?\s*(?:\d+\s+)?(?:H|W|D|L|SH|AH|Height|Width|Depth|Length|Seat|[A-Z][A-Za-z ]{1,40}\s+[–-])",
+                r"^[•\-–]?\s*(?:\d+\s+)?(?:H|W|D|L|SH|AH|S\.?\s*Height|Height|Width|Depth|Length|Seat|[A-Z][A-Za-z ]{1,40}\s+[–-])",
                 value,
                 re.I,
             )
@@ -1299,10 +2032,13 @@ def extract_dimensions_from_lines(lines: list[str]) -> str:
         ):
             current.append(value)
             previous_was_label = False
+            previous_label_unit = ""
             continue
         if current:
             groups.append(current)
             current = []
+        if not label_only:
+            previous_label_unit = ""
         previous_was_label = label_only
     if current:
         groups.append(current)
@@ -1310,7 +2046,7 @@ def extract_dimensions_from_lines(lines: list[str]) -> str:
     if not groups:
         return ""
     best = max(groups, key=lambda group: (len(group), sum(len(item) for item in group)))
-    return clean_text("; ".join(best[:6]))
+    return normalize_dimension_text_to_cm(clean_text("; ".join(best[:6])))
 
 
 def add_synthesized_dimensions(info: dict[str, Any]) -> None:
@@ -1329,9 +2065,9 @@ def add_synthesized_dimensions(info: dict[str, Any]) -> None:
             dimensions = " x ".join(ordered_parts)
     if dimensions:
         details = dict(details)
-        details["dimensions"] = dimensions
+        details["dimensions"] = normalize_dimension_text_to_cm(dimensions)
         info["details"] = details
-        info["dimensions"] = dimensions
+        info["dimensions"] = details["dimensions"]
 
 
 def line_looks_like_price(line: str) -> bool:
@@ -1544,7 +2280,7 @@ def extract_heading_text_block(
     description_lines: list[str] = []
     for line in content_lines:
         if line_looks_like_dimensions(line):
-            details.setdefault("dimensions", clean_dimension_text(line))
+            details.setdefault("dimensions", normalize_dimension_text_to_cm(line))
             continue
         seat_height = re.match(r"^(Seat\s+height)\s*:?\s*(.+)$", line, re.I)
         if seat_height:
@@ -1563,7 +2299,7 @@ def extract_heading_text_block(
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
 
@@ -1621,9 +2357,40 @@ def extract_fundamente_product_info(soup: BeautifulSoup, base_url: str) -> dict[
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
+
+
+def normalize_sitonvintage_dimensions(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    normalized = normalize_dimension_text_to_cm(text)
+    if normalized and normalized != text:
+        return normalized
+    matches = re.findall(
+        r"([0-9]+(?:[.,][0-9]+)?)\s*(cm|mm|m)\s*([hwd])\b",
+        text,
+        re.I,
+    )
+    if not matches:
+        matches = re.findall(
+            r"\b([hwd])\s*[:=]\s*([0-9]+(?:[.,][0-9]+)?)\s*(cm|mm|m)\b",
+            text,
+            re.I,
+        )
+        matches = [(number, unit, label) for label, number, unit in matches]
+    parts_by_label: dict[str, str] = {}
+    for number, unit, label in matches:
+        converted = format_dimension_cm(number, unit)
+        if converted:
+            parts_by_label[label.upper()] = f"{converted} cm"
+    return "; ".join(
+        f"{label}: {parts_by_label[label]}"
+        for label in ("W", "D", "H")
+        if label in parts_by_label
+    )
 
 
 def extract_sitonvintage_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
@@ -1637,6 +2404,40 @@ def extract_sitonvintage_product_info(soup: BeautifulSoup, base_url: str) -> dic
         "url": base_url,
         "name": name,
     }
+    meta_description = ""
+    for attrs in (
+        {"name": "description"},
+        {"property": "og:description"},
+        {"name": "twitter:description"},
+    ):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            meta_description = clean_text(tag["content"])
+            break
+    if meta_description:
+        info["description"] = meta_description
+        dimensions_match = re.search(
+            r"\bDimensions?\s*:\s*(.+?)(?:\.\s+|\s+Price\s*:)",
+            meta_description,
+            re.I,
+        )
+        if dimensions_match:
+            dimensions = normalize_sitonvintage_dimensions(dimensions_match.group(1))
+            if dimensions:
+                info["dimensions"] = dimensions
+                info["details"] = {"dimensions": dimensions}
+        price_match = re.search(r"\bPrice\s*:\s*([^.!?]+)", meta_description, re.I)
+        if price_match:
+            price = clean_price_text(price_match.group(1)).rstrip(",-. ")
+            if price:
+                info["price"] = price
+                if "€" in price:
+                    info["currency"] = "EUR"
+                elif "£" in price:
+                    info["currency"] = "GBP"
+                elif "$" in price:
+                    info["currency"] = "USD"
+
     lines = [clean_text(line) for line in (soup.body.get_text("\n").splitlines() if soup.body else [])]
     lines = [line for line in lines if line]
     for index, line in enumerate(lines):
@@ -1691,7 +2492,7 @@ def extract_morentz_product_info(soup: BeautifulSoup, base_url: str) -> dict[str
         detail_key = normalize_detail_label(label)
         if detail_key == "dimensions":
             existing = str(details.get("dimensions") or "")
-            dimension_value = clean_dimension_text(value)
+            dimension_value = normalize_dimension_text_to_cm(value)
             details["dimensions"] = clean_text("; ".join(item for item in [existing, dimension_value] if item))
         else:
             details[detail_key] = clean_detail_value(value)
@@ -1706,7 +2507,7 @@ def extract_morentz_product_info(soup: BeautifulSoup, base_url: str) -> dict[str
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
 
@@ -1747,7 +2548,7 @@ def extract_hgallery_product_info(soup: BeautifulSoup, base_url: str) -> dict[st
             condition_lines.append(line)
         elif section == "dimensions":
             if line_looks_like_dimensions(line) or re.search(r"\d.*\b(?:cm|in|inch|inches)\b", line, re.I):
-                dimension_lines.append(clean_dimension_text(line))
+                dimension_lines.append(normalize_dimension_text_to_cm(line))
         elif section == "description":
             description_lines.append(line)
 
@@ -1774,7 +2575,7 @@ def extract_hgallery_product_info(soup: BeautifulSoup, base_url: str) -> dict[st
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     add_synthesized_dimensions(info)
     return info
 
@@ -1785,15 +2586,45 @@ def extract_squarespace_product_info(soup: BeautifulSoup, base_url: str) -> dict
         or soup.select_one("h1.product-title")
         or soup.select_one(".ProductItem-details-title")
         or soup.select_one(".product-title")
+        or soup.find("h1")
     )
     name = clean_product_title(clean_text(heading.get_text(" ")) if heading else "")
     if not name:
         return {}
-    return {
+
+    info: dict[str, Any] = {
         "source": "squarespace-product-page",
         "url": base_url,
         "name": name,
     }
+    description_tag = (
+        soup.find("meta", attrs={"name": "description"})
+        or soup.find("meta", attrs={"property": "og:description"})
+        or soup.find("meta", attrs={"name": "twitter:description"})
+    )
+    description = clean_text(description_tag.get("content")) if description_tag else ""
+    dimensions = extract_dimensions_from_text(description)
+    if dimensions:
+        info["dimensions"] = dimensions
+        info["details"] = {"dimensions": dimensions}
+    if description:
+        info["description"] = description
+
+    price_tag = (
+        soup.find("meta", attrs={"property": "product:price:amount"})
+        or soup.find("meta", attrs={"property": "og:price:amount"})
+    )
+    currency_tag = (
+        soup.find("meta", attrs={"property": "product:price:currency"})
+        or soup.find("meta", attrs={"property": "og:price:currency"})
+    )
+    price = clean_price_text(price_tag.get("content")) if price_tag else ""
+    currency = clean_text(currency_tag.get("content")).upper() if currency_tag else ""
+    if price:
+        info["price"] = price
+    if currency:
+        info["currency"] = currency
+    return info
 
 
 def extract_oldboy_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
@@ -1827,6 +2658,8 @@ def extract_simple_heading_product_info(
 
 def extract_domain_product_info(soup: BeautifulSoup, base_url: str) -> dict[str, Any]:
     hostname = normalized_hostname(base_url)
+    if hostname in STUDIO_1_DOMAINS:
+        return extract_studio_1_product_info(soup, base_url)
     if hostname in MORENTZ_DOMAINS:
         return extract_morentz_product_info(soup, base_url)
     if hostname in HGALLERY_DOMAINS:
@@ -1920,8 +2753,8 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         h1 = soup.find("h1")
         if h1:
             name = clean_text(h1.get_text(" "))
-    name = clean_product_title(name)
-    title_name = clean_product_title(clean_text(soup.title.string if soup.title else ""))
+    name = strip_source_site_suffix(name, base_url)
+    title_name = strip_source_site_suffix(clean_text(soup.title.string if soup.title else ""), base_url)
     if existing_name and not is_weak_existing_name(existing_name) and is_weak_existing_name(name):
         name = clean_product_title(existing_name)
     if title_name and is_weak_existing_name(name):
@@ -1998,7 +2831,7 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
         detail_key = normalize_detail_label(clean_detail_key(label))
         detail_value = clean_detail_value(value)
         if detail_key == "dimensions":
-            detail_value = clean_dimension_text(detail_value)
+            detail_value = normalize_dimension_text_to_cm(detail_value)
             if str(detail_value).lower() in {"soon", "coming soon", "n/a", "na", "none", "-", "stock", "in stock"}:
                 return
             if not labeled_value_looks_like_dimensions(str(detail_value)):
@@ -2187,13 +3020,21 @@ def extract_dom_product_info(soup: BeautifulSoup, base_url: str, existing_name: 
     elif description:
         info["description"] = description
     if isinstance(heading_info.get("details"), dict):
-        details.update(heading_info["details"])
+        for detail_key, detail_value in heading_info["details"].items():
+            if detail_key == "dimensions":
+                existing_dimensions = str(details.get("dimensions") or "")
+                candidate_dimensions = normalize_dimension_text_to_cm(detail_value)
+                if not existing_dimensions or candidate_dimensions.count(";") > existing_dimensions.count(";"):
+                    details["dimensions"] = candidate_dimensions
+            else:
+                details[detail_key] = detail_value
+    details = sanitize_source_creator_details(details, base_url)
     if details:
         info["details"] = details
     if details.get("dimensions"):
-        info["dimensions"] = str(details["dimensions"])
+        info["dimensions"] = normalize_dimension_text_to_cm(details["dimensions"])
     add_synthesized_dimensions(info)
-    return info
+    return sanitize_source_product_info(info, base_url)
 
 
 def parse_shopify_product_payload(
@@ -2242,12 +3083,25 @@ def parse_shopify_product_payload(
     return info, list(dict.fromkeys(u for u in images if u))
 
 
-def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any], list[str]]:
+def extract_shopify_store_currency(soup: BeautifulSoup) -> str:
+    script_text = "\n".join(script.get_text() for script in soup.find_all("script"))
+    for pattern in (
+        r'"paymentSettings"\s*:\s*\{[^{}]*"currencyCode"\s*:\s*"([A-Z]{3})"',
+        r'"shop"\s*:\s*\{[^{}]*"currencyCode"\s*:\s*"([A-Z]{3})"',
+    ):
+        match = re.search(pattern, script_text)
+        if match and match.group(1) in KNOWN_CURRENCY_CODES:
+            return match.group(1)
+    return ""
+
+
+def try_shopify_json(url: str, session: requests.Session, currency: str = "") -> tuple[dict[str, Any], list[str]]:
     parsed = urlparse(url)
     match = re.search(r"(/products/[^/?#]+)", parsed.path)
     if not match:
         return {}, []
-    endpoint = urlunparse((parsed.scheme, parsed.netloc, match.group(1) + ".js", "", "", ""))
+    query = urlencode({"currency": currency}) if currency in KNOWN_CURRENCY_CODES else ""
+    endpoint = urlunparse((parsed.scheme, parsed.netloc, match.group(1) + ".js", "", query, ""))
     try:
         response = session.get(endpoint, timeout=20)
         if response.status_code in {401, 403, 429}:
@@ -2271,6 +3125,8 @@ def try_shopify_json(url: str, session: requests.Session) -> tuple[dict[str, Any
         return {}, []
 
     info, images = parse_shopify_product_payload(product, endpoint, "shopify-product-json")
+    if currency in KNOWN_CURRENCY_CODES and price_is_valid(info.get("price")):
+        info["currency"] = currency
     if not info.get("url"):
         info["url"] = endpoint.removesuffix(".js")
     return info, images
@@ -2340,13 +3196,13 @@ def extract_analytics_product_info(soup: BeautifulSoup) -> dict[str, Any]:
     return {}
 
 
-def try_monument_airtable_api(
+def try_monument_items_api(
     url: str,
     session: requests.Session,
     max_images: int,
 ) -> dict[str, Any] | None:
     parsed = urlparse(url)
-    if parsed.hostname not in {"www.monumentgallery.co.uk", "monumentgallery.co.uk"}:
+    if normalized_hostname(url) != "monumentgallery.co.uk":
         return None
     match = re.search(r"^/product/([^/?#]+)/?$", parsed.path)
     if not match:
@@ -2357,7 +3213,7 @@ def try_monument_airtable_api(
         (
             parsed.scheme,
             parsed.netloc,
-            "/api/airtable-items",
+            "/api/items",
             "",
             urlencode({"slug": slug}),
             "",
@@ -2374,32 +3230,27 @@ def try_monument_airtable_api(
     if not isinstance(item, dict):
         return None
 
-    details: dict[str, Any] = {
-        "Designer": clean_text(item.get("designer")),
-        "Manufacturer": clean_text(item.get("manufacturer")),
-        "Material": clean_text(item.get("material")),
-        "Period": clean_text(item.get("period")),
-        "dimensions": clean_text(item.get("dimensions")),
-        "Condition": clean_text(item.get("condition")),
-    }
-    details = {key: value for key, value in details.items() if value}
-    extra_details = details_from_mapping(
-        item,
-        {
-            "images",
-            "image",
-            "displayName",
-            "description",
-            "availability",
-            "designer",
-            "manufacturer",
-            "material",
-            "period",
-            "dimensions",
-            "condition",
-        },
+    detail_fields = (
+        ("Collection", item.get("collection")),
+        ("Category", item.get("category")),
+        ("Type", item.get("type")),
+        ("Designer", item.get("designer")),
+        ("Manufacturer", item.get("manufacturer")),
+        ("Material", item.get("material")),
+        ("Period", item.get("period")),
+        ("Condition", item.get("condition")),
+        ("Availability", item.get("availability")),
+        ("Literature", item.get("literature")),
+        ("Origin", item.get("origin")),
     )
-    details.update(extra_details)
+    details = {}
+    for label, value in detail_fields:
+        cleaned = clean_detail_value(value)
+        if cleaned not in (None, "", [], {}):
+            details[normalize_detail_label(label)] = cleaned
+
+    raw_dimensions = clean_text(item.get("dimensions"))
+    dimensions = normalize_dimension_text_to_cm(raw_dimensions)
     images = []
     for image in as_list(item.get("images")):
         if isinstance(image, str):
@@ -2411,15 +3262,17 @@ def try_monument_airtable_api(
     product_info: dict[str, Any] = {
         "name": clean_text(item.get("displayName")),
         "description": clean_text(item.get("description")),
+        "price": clean_price_text(item.get("price")),
+        "currency": "GBP" if item.get("price") not in (None, "") else "",
         "availability": clean_text(item.get("availability")),
-        "source": "monument-airtable-api",
+        "source": "monument-items-api",
         "url": url,
         "page_url": url,
     }
     if details:
         product_info["details"] = details
-    if details.get("dimensions"):
-        product_info["dimensions"] = details["dimensions"]
+    if dimensions:
+        product_info["dimensions"] = dimensions
     product_info = {
         key: value for key, value in product_info.items() if value not in (None, "", [], {})
     }
@@ -2428,11 +3281,11 @@ def try_monument_airtable_api(
         {
             "url": image,
             "score": 100,
-            "source": "monument-airtable-api",
+            "source": "monument-items-api",
             "alt": product_info.get("name", ""),
             "width": None,
             "height": None,
-            "reasons": ["monument airtable product image"],
+            "reasons": ["monument items API product image"],
         }
         for image in images[:max_images]
     ]
@@ -2716,6 +3569,53 @@ def fetch_static(url: str) -> tuple[str, str]:
     return response.text, response.url
 
 
+def jina_reader_url(url: str) -> str:
+    return f"https://r.jina.ai/{url}"
+
+
+def markdown_snapshot_to_html(markdown: str, base_url: str) -> str:
+    title = ""
+    body_parts: list[str] = []
+    for raw_line in markdown.splitlines():
+        line = clean_text(raw_line)
+        if not line:
+            continue
+        if line.startswith("Title:") and not title:
+            title = clean_text(line.split(":", 1)[1])
+            continue
+        if line.startswith("URL Source:") or line.startswith("Published Time:") or line == "Markdown Content:":
+            continue
+        image_matches = list(re.finditer(r"!\[[^\]]*\]\((https?://[^)\s]+)", line))
+        if image_matches:
+            for match in image_matches:
+                body_parts.append(f'<img src="{html.escape(match.group(1), quote=True)}" />')
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading:
+            body_parts.append(f"<h1>{html.escape(clean_text(heading.group(1)))}</h1>")
+            continue
+        body_parts.append(f"<p>{html.escape(line)}</p>")
+    title_html = f"<title>{html.escape(title)}</title>" if title else ""
+    return f"<html><head>{title_html}</head><body>{''.join(body_parts)}</body></html>"
+
+
+def fetch_jina_snapshot(url: str) -> tuple[str, str]:
+    endpoint = jina_reader_url(url)
+    parsed = urlparse(url)
+    logger.warning("extractor stage=fetch_jina_start host=%s path=%s", parsed.netloc, parsed.path or "/")
+    response = requests.get(
+        endpoint,
+        timeout=45,
+        headers={"Accept": "text/plain, text/markdown, */*"},
+    )
+    response.raise_for_status()
+    text = response.text
+    if not text or "Markdown Content:" not in text:
+        raise RuntimeError("Jina snapshot did not return readable markdown")
+    logger.warning("extractor stage=fetch_jina_done bytes=%d", len(text))
+    return markdown_snapshot_to_html(text, url), url
+
+
 def fetch_rendered(url: str) -> tuple[str, str]:
     try:
         from playwright.sync_api import sync_playwright
@@ -2821,10 +3721,10 @@ def extract(
     )
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
-    fast_result = try_monument_airtable_api(url, session, max_images)
-    if fast_result and fast_result.get("product", {}).get("dimensions"):
+    fast_result = try_monument_items_api(url, session, max_images)
+    if fast_result:
         logger.info(
-            "extractor event=done host=%s source=monument_airtable images=%d elapsed=%.2fs",
+            "extractor event=done host=%s source=monument_items_api images=%d elapsed=%.2fs",
             parsed.netloc,
             len(fast_result.get("images") or []),
             time.monotonic() - started,
@@ -2834,6 +3734,7 @@ def extract(
     try:
         html, final_url = fetch_rendered(url) if render else fetch_static(url)
     except Exception as exc:
+        fetch_error: Exception = exc
         if allow_cloudflare_bypass and should_try_cloudflare_bypass_from_fetch_error(exc):
             logger.warning(
                 "extractor event=fetch_blocked_try_cloudflare host=%s render=%s reason=%r",
@@ -2842,11 +3743,21 @@ def extract(
                 str(exc),
             )
             try:
-                html, final_url = fetch_cloudflare_bypassed(url)
-            except CloudflareBypassError as cf_exc:
-                raise RuntimeError(f"Blocked by Cloudflare/security verification page: {cf_exc}") from cf_exc
-        else:
-            raise
+                html, final_url = fetch_jina_snapshot(url)
+            except Exception:
+                try:
+                    html, final_url = fetch_cloudflare_bypassed(url)
+                except Exception as cf_exc:
+                    fetch_error = RuntimeError(f"Blocked by Cloudflare/security verification page: {cf_exc}")
+                else:
+                    fetch_error = None  # type: ignore[assignment]
+            else:
+                fetch_error = None  # type: ignore[assignment]
+        if fetch_error is not None:
+            try:
+                html, final_url = fetch_jina_snapshot(url)
+            except Exception:
+                raise fetch_error
     soup = BeautifulSoup(html, "lxml")
     page_title = clean_text(soup.title.string if soup.title else "")
     body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
@@ -2864,15 +3775,22 @@ def extract(
                 soup = BeautifulSoup(html, "lxml")
                 page_title = clean_text(soup.title.string if soup.title else "")
                 body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
-            except CloudflareBypassError as exc:
-                raise RuntimeError(f"Blocked by Cloudflare/security verification page: {exc}") from exc
+            except Exception as exc:
+                try:
+                    html, final_url = fetch_jina_snapshot(url)
+                    soup = BeautifulSoup(html, "lxml")
+                    page_title = clean_text(soup.title.string if soup.title else "")
+                    body_text = clean_text(soup.body.get_text(" ") if soup.body else "")
+                except Exception as jina_exc:
+                    raise RuntimeError(f"Blocked by Cloudflare/security verification page: {exc}") from jina_exc
         if is_cloudflare_blocked(page_title, body_text, html):
             logger.warning("extractor event=blocked_after_cloudflare host=%s final_url=%s title=%r", parsed.netloc, final_url, page_title)
             raise RuntimeError("Blocked by Cloudflare/security verification page")
 
+    shopify_store_currency = extract_shopify_store_currency(soup)
     jsonld_info, jsonld_images = extract_jsonld_products(soup, final_url)
     meta_info, meta_images = extract_meta_info(soup, final_url)
-    shopify_info, shopify_images = try_shopify_json(final_url, session)
+    shopify_info, shopify_images = try_shopify_json(final_url, session, shopify_store_currency)
     inline_shopify_info, inline_shopify_images = extract_inline_shopify_product_json(soup, final_url)
     analytics_info = extract_analytics_product_info(soup)
     nextjs_info = extract_nextjs_product_info(soup)
@@ -2883,15 +3801,29 @@ def extract(
     product_info = {}
     for info in (jsonld_info, shopify_info, inline_shopify_info, meta_info):
         product_info = merge_product_info(product_info, info)
+    if (
+        shopify_store_currency
+        and shopify_info.get("currency") == shopify_store_currency
+        and price_is_valid(shopify_info.get("price"))
+    ):
+        product_info = merge_product_info(shopify_info, product_info)
     dom_info = extract_dom_product_info(soup, final_url, product_info.get("name", ""))
+    if price_is_valid(product_info.get("price")):
+        dom_info.pop("price", None)
+        if product_info.get("currency"):
+            dom_info.pop("currency", None)
     product_info = merge_product_info(dom_info, product_info)
     product_info = merge_product_info(analytics_info, product_info)
     product_info = merge_product_info(nextjs_info, product_info)
     product_info = merge_product_info(auctionet_info, product_info)
     product_info = merge_product_info(domain_info, product_info)
     if isinstance(domain_info.get("details"), dict):
-        product_info["details"] = domain_info["details"]
+        existing_details = product_info.get("details")
+        merged_details = dict(existing_details) if isinstance(existing_details, dict) else {}
+        merged_details.update(domain_info["details"])
+        product_info["details"] = merged_details
     add_synthesized_dimensions(product_info)
+    product_info = sanitize_source_product_info(product_info, final_url)
     product_info["page_url"] = final_url
 
     authoritative_images = domain_product_images or shopify_images or inline_shopify_images or jsonld_images
