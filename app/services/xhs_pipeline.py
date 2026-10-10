@@ -27,10 +27,11 @@ DUOMI_CREATE_URL = "https://duomiapi.com/v1/images/generations?async=true"
 DUOMI_TASK_URL_TEMPLATE = "https://duomiapi.com/v1/tasks/{task_id}"
 ARK_IMAGE_GENERATION_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
 ARK_RESPONSES_URL = "https://ark.cn-beijing.volces.com/api/v3/responses"
+ARK_CHAT_COMPLETIONS_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 DEFAULT_ARK_IMAGE_MODEL = "doubao-seedream-5-0-260128"
 DEFAULT_ARK_IMAGE_SIZE = "1728x2304"
 DEFAULT_ARK_REFERENCE_MAX_PIXELS = 36_000_000
-DEFAULT_XHS_COPY_MODEL = "deepseek-v4-flash-260425"
+DEFAULT_XHS_COPY_MODEL = "doubao-seed-2-0-pro-260215"
 DEFAULT_XHS_POST_API_BASE = "https://xhspost.aivip1.top"
 DEFAULT_XHS_POST_API_KEY = "xhs_post"
 TERMINAL_SUCCESS = {"succeeded", "success", "completed", "complete"}
@@ -934,8 +935,8 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
 9、文案中只允许出现"旨丘"作为店铺/品牌名称，禁止出现其他任何店铺名、网站名、出品方名称。
 10、正文部分除产品名称外禁止出现不必要英文单词。"""
     user_prompt = f"这是产品的详细信息：\n{product_text(product)}\n\n请根据以上信息生成小红书标题和正文。"
-    model = os.getenv("XHS_COPY_MODEL") or os.getenv("DEEPSEEK_MODEL") or DEFAULT_XHS_COPY_MODEL
-    url = os.getenv("ARK_RESPONSES_URL", ARK_RESPONSES_URL)
+    model = os.getenv("XHS_COPY_MODEL") or os.getenv("XIANYU_COPY_MODEL") or DEFAULT_XHS_COPY_MODEL
+    url = os.getenv("ARK_CHAT_COMPLETIONS_URL", ARK_CHAT_COMPLETIONS_URL)
     attempts = xhs_copy_max_attempts()
     retry_delay = xhs_copy_retry_delay()
     prompt_base = f"{system_prompt}\n\n{user_prompt}"
@@ -946,7 +947,7 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
     for attempt in range(1, attempts + 1):
         attempt_started = time.monotonic()
         logger.info(
-            "xhs stage=generate_copy_attempt_start request_id=%s job_id=%s attempt=%d max_attempts=%d provider=ark model=%s",
+            "xhs stage=generate_copy_attempt_start request_id=%s job_id=%s attempt=%d max_attempts=%d provider=ark-chat model=%s",
             request_id_value,
             job_id,
             attempt,
@@ -959,25 +960,18 @@ def generate_xhs_copy(product: dict[str, Any], request_id_value: str | None = No
                 headers=headers,
                 json={
                     "model": model,
-                    "stream": False,
-                    "input": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": prompt_base,
-                                }
-                            ],
-                        }
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
                     ],
+                    "temperature": 0.6,
                 },
                 timeout=120,
             )
             if response.status_code >= 400:
-                raise XHSPipelineError(f"Ark responses HTTP {response.status_code}: {response.text[:500]}")
+                raise XHSPipelineError(f"Ark chat HTTP {response.status_code}: {response.text[:500]}")
             payload = response.json()
-            content = extract_response_text(payload)
+            content = str(payload["choices"][0]["message"]["content"]).strip()
             category, content_without_category = extract_xhs_ai_category(content)
             parts = [part.strip() for part in content_without_category.splitlines() if part.strip()]
             if not parts:

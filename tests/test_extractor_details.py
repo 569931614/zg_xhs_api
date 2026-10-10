@@ -4,12 +4,17 @@ from unittest.mock import Mock
 from bs4 import BeautifulSoup
 
 from app.services.extractor import (
+    ImageCandidate,
+    dedupe_image_candidates,
     extract_jsonld_products,
     extract_domain_product_info,
     extract_dom_product_info,
     extract_dimensions_from_lines,
     extract_dimensions_from_text,
+    extract_nextjs_product_image_urls,
+    filter_domain_image_candidates,
     format_dimension_cm,
+    gather_image_candidates,
     jina_reader_url,
     normalize_detail_label,
     normalize_dimension_text_to_cm,
@@ -20,6 +25,166 @@ from app.services.extractor import (
 
 
 class ExtractorDetailLabelTest(unittest.TestCase):
+    def test_dedupe_prefers_original_variant_over_gallery_thumbnail(self) -> None:
+        candidates = [
+            ImageCandidate(
+                url="https://studioalium.nl/wp-content/uploads/2026/08/Italian-floral-chandelier-1960s-vintage-hanging-lamp-6-220x220.jpg",
+                reasons=["page image candidate", "inside product/media block"],
+                width=220,
+                height=220,
+                source="dom",
+                order=3,
+            ),
+            ImageCandidate(
+                url="https://studioalium.nl/wp-content/uploads/2026/08/Italian-floral-chandelier-1960s-vintage-hanging-lamp-6-1000x1000.jpg",
+                reasons=["page image candidate", "inside product/media block"],
+                width=220,
+                height=220,
+                source="dom",
+                order=3,
+            ),
+            ImageCandidate(
+                url="https://studioalium.nl/wp-content/uploads/2026/08/Italian-floral-chandelier-1960s-vintage-hanging-lamp-6-scaled.jpg",
+                reasons=["linked image file"],
+                source="link",
+                order=100_003,
+            ),
+        ]
+
+        deduped = dedupe_image_candidates(candidates)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(
+            deduped[0].url,
+            "https://studioalium.nl/wp-content/uploads/2026/08/Italian-floral-chandelier-1960s-vintage-hanging-lamp-6-scaled.jpg",
+        )
+        self.assertEqual(deduped[0].source, "dom")
+        self.assertEqual(deduped[0].order, 3)
+
+    def test_woocommerce_lazy_gallery_keeps_full_images_and_drops_spacer(self) -> None:
+        html = """
+        <html><body>
+          <div class="product gallery">
+            <img src="https://example.com/wp-content/uploads/2026/09/1-DSC01806-800x600.jpg"
+              srcset="https://example.com/wp-content/uploads/2026/09/1-DSC01806.jpg 2048w"
+              width="800" height="600" alt="Organic Floral Wood Sculpture" />
+            <img class="swiper-lazy"
+              src="https://example.com/wp-content/plugins/commercegurus-commercekit/assets/images/spacer.png"
+              data-src="https://example.com/wp-content/uploads/2026/09/2-DSC01808.jpg"
+              data-srcset="https://example.com/wp-content/uploads/2026/09/2-DSC01808.jpg 2048w"
+              width="2048" height="1535" />
+            <img src="https://example.com/wp-content/uploads/2026/09/2-DSC01808-150x112.jpg"
+              srcset="https://example.com/wp-content/uploads/2026/09/2-DSC01808.jpg 2048w"
+              width="150" height="112" />
+          </div>
+        </body></html>
+        """
+
+        candidates = gather_image_candidates(
+            BeautifulSoup(html, "lxml"),
+            "https://example.com/product/item",
+            [],
+            [],
+            "Organic Floral Wood Sculpture",
+        )
+
+        urls = [candidate.url for candidate in candidates]
+        self.assertIn("https://example.com/wp-content/uploads/2026/09/1-DSC01806.jpg", urls)
+        self.assertIn("https://example.com/wp-content/uploads/2026/09/2-DSC01808.jpg", urls)
+        self.assertFalse(any("spacer.png" in url for url in urls))
+        image_2 = next(item for item in candidates if item.url.endswith("/2-DSC01808.jpg"))
+        self.assertEqual(image_2.width, 2048)
+        self.assertEqual(image_2.height, 1535)
+
+    def test_sauceldn_header_identity_image_is_dropped(self) -> None:
+        html = """
+        <html><body>
+          <header>
+            <img src="https://images.squarespace-cdn.com/content/v1/site/1561411324869-logo/Untitled-1.jpg?format=1000w"
+              alt="Sauce" />
+          </header>
+          <main class="product media">
+            <img src="https://images.squarespace-cdn.com/content/v1/site/1790036077158/623A3340.jpg"
+              alt="623A3340.jpg" />
+            <img src="https://images.squarespace-cdn.com/content/v1/site/1790036077545/623A3342.jpg"
+              alt="623A3342.jpg" />
+          </main>
+        </body></html>
+        """
+
+        candidates = gather_image_candidates(
+            BeautifulSoup(html, "lxml"),
+            "https://www.sauceldn.com/early-20th-century-bronze-talon-lamp/",
+            [],
+            [],
+            "Early 20th Century Bronze Talon Lamp",
+        )
+
+        urls = [candidate.url for candidate in candidates]
+        self.assertFalse(any("Untitled-1.jpg" in url for url in urls))
+        self.assertEqual(len(urls), 2)
+
+    def test_yootheme_srcset_query_comma_is_not_split_as_candidate(self) -> None:
+        html = """
+        <html><body>
+          <main class="product media">
+            <picture>
+              <source type="image/webp"
+                srcset="/media/yootheme/cache/86/JorgenMovelskov_HarpChair_ChristensenLarsen_1-869b957d.webp?src=vintage-design-furniture/seating/JorgenHovelskov_HarpChair_ChristensenLarsen/JorgenMovelskov_HarpChair_ChristensenLarsen_1.jpg&amp;type=webp,85&amp;hash=9a642b8d 850w" />
+              <img src="/vintage-design-furniture/seating/JorgenHovelskov_HarpChair_ChristensenLarsen/JorgenMovelskov_HarpChair_ChristensenLarsen_1.jpg"
+                width="850" height="620" />
+            </picture>
+          </main>
+        </body></html>
+        """
+
+        candidates = gather_image_candidates(
+            BeautifulSoup(html, "lxml"),
+            "https://studio-1.nl/seating/lounge-chair/example",
+            [],
+            [],
+            "Jorgen Hovelskov Early Harp Chair",
+        )
+
+        urls = [candidate.url for candidate in candidates]
+        self.assertFalse(any("85&hash" in url for url in urls))
+        self.assertTrue(any("/media/yootheme/cache/86/" in url for url in urls))
+
+    def test_studio125_keeps_structured_second_image(self) -> None:
+        candidates = [
+            ImageCandidate(url="https://cdn.example.com/one.jpg", reasons=["structured product image"]),
+            ImageCandidate(url="https://cdn.example.com/two.jpg", reasons=["structured product image"]),
+            ImageCandidate(url="https://cdn.example.com/three.jpg", reasons=["structured product image"]),
+        ]
+
+        filtered = filter_domain_image_candidates(candidates, "https://www.studio125.co.uk/products/example")
+
+        self.assertEqual([item.url for item in filtered], [item.url for item in candidates])
+
+    def test_nextjs_flight_extracts_product_image_arrays(self) -> None:
+        html = r"""
+        <html><body>
+          <script>
+            self.__next_f=self.__next_f||[];
+            self.__next_f.push([1,"5:[\"$\",\"$L16\",null,{\"object\":{\"name\":\"Cupboard\",\"images\":[\"https://cdn.example.com/one.jpg\",\"https://cdn.example.com/two.webp\"],\"cdnImages\":[\"https://cdn.example.com/one.jpg\",\"https://cdn.example.com/three.jpg\"]}}]\n"]);
+          </script>
+        </body></html>
+        """
+
+        images = extract_nextjs_product_image_urls(
+            BeautifulSoup(html, "lxml"),
+            "https://www.studio125.co.uk/collections/antiques/objects/example",
+        )
+
+        self.assertEqual(
+            images,
+            [
+                "https://cdn.example.com/one.jpg",
+                "https://cdn.example.com/two.webp",
+                "https://cdn.example.com/three.jpg",
+            ],
+        )
+
     def test_monument_items_api_extracts_product_payload(self) -> None:
         response = Mock()
         response.raise_for_status.return_value = None
@@ -63,6 +228,7 @@ class ExtractorDetailLabelTest(unittest.TestCase):
         self.assertEqual(result["product"]["details"]["Manufacturer"], "Akita Mokko")
         self.assertEqual(result["product"]["details"]["Collection"], ["Furniture"])
         self.assertEqual(len(result["images"]), 2)
+        self.assertNotIn("score", result["images"][0])
         session.get.assert_called_once_with(
             "https://www.monumentgallery.co.uk/api/items?slug=mirror-by-sori-yanagi-for-akita-mokko-d25c51c168",
             timeout=12,

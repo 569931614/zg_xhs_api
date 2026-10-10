@@ -52,6 +52,9 @@ SECOND_IMAGE_FILTER_DOMAINS = {"studio125.co.uk"}
 EARLY_GALLERY_FILTER_DOMAINS = {"pauletteintstad.com"}
 PRIMARY_GALLERY_ONLY_DOMAINS = {"ancien.co.uk", "pauletteintstad.com"}
 HASH_PROJECT_ROUTE_DOMAINS = {"sauceldn.com"}
+SOURCE_SITE_ALIAS_OVERRIDES = {
+    "sauceldn.com": {"sauce", "sauce ldn"},
+}
 ATKRIS_PRODUCT_IMAGE_DOMAINS = {"atkris.com"}
 FUNDAMENTE_DOMAINS = {"fundamente.nl"}
 SITONVINTAGE_DOMAINS = {"sitonvintage.com"}
@@ -96,7 +99,7 @@ NOISE_RE = re.compile(
     r"(logo|icon|sprite|avatar|payment|paypal|visa|mastercard|amex|klarna|"
     r"afterpay|trust|badge|seal|banner|hero|background|bg-|newsletter|"
     r"social|facebook|instagram|tiktok|youtube|pinterest|review|star|"
-    r"flag|placeholder|loading|spinner|favicon|screenshot|app[-_ ]?store|"
+    r"flag|placeholder|spacer|loading|spinner|favicon|screenshot|app[-_ ]?store|"
     r"mobile[-_ ]?app)",
     re.I,
 )
@@ -108,6 +111,11 @@ PRODUCT_RE = re.compile(
 )
 
 SMALL_SIZE_RE = re.compile(r"(^|[_-])(\d{1,2})x(\d{1,2})([_\.-]|$)", re.I)
+IMAGE_SIZE_VARIANT_RE = re.compile(r"[_-](\d{2,5})x(\d{2,5})(?=$|[_\.-])", re.I)
+IMAGE_WIDTH_VARIANT_RE = re.compile(
+    r"[_-](600|804|1026|1080x?|1281|1536|1800x?|1920|2000x?)(?=$|[_\.-])",
+    re.I,
+)
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -132,7 +140,6 @@ def render_semaphore() -> threading.BoundedSemaphore:
 @dataclass
 class ImageCandidate:
     url: str
-    score: int = 0
     reasons: list[str] = field(default_factory=list)
     width: int | None = None
     height: int | None = None
@@ -140,8 +147,7 @@ class ImageCandidate:
     source: str = ""
     order: int = 10_000
 
-    def add(self, points: int, reason: str) -> None:
-        self.score += points
+    def add_reason(self, reason: str) -> None:
         if reason not in self.reasons:
             self.reasons.append(reason)
 
@@ -831,6 +837,58 @@ def image_identity_key(url: str) -> str:
     return f"{parsed.netloc}{dirname}/{stem}".lower()
 
 
+def image_url_variant_dimensions(url: str) -> tuple[int | None, int | None]:
+    parsed = urlparse(url)
+    if is_next_image_proxy_path(parsed.path):
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        width = parse_size(params.get("w") or params.get("width"))
+        height = parse_size(params.get("h") or params.get("height"))
+        return width, height
+
+    filename = unquote(parsed.path.rsplit("/", 1)[-1]).lower()
+    stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
+    size_match = IMAGE_SIZE_VARIANT_RE.search(stem)
+    if size_match:
+        return int(size_match.group(1)), int(size_match.group(2))
+    width_match = IMAGE_WIDTH_VARIANT_RE.search(stem)
+    if width_match:
+        return parse_size(width_match.group(1)), None
+    return None, None
+
+
+def image_variant_sort_key(item: ImageCandidate) -> tuple[int, int, int, int, int]:
+    url_width, url_height = image_url_variant_dimensions(item.url)
+    width = max([value for value in (item.width, url_width) if value is not None], default=0)
+    height = max([value for value in (item.height, url_height) if value is not None], default=0)
+    max_side = max(width, height)
+    area = width * height
+
+    filename = unquote(urlparse(item.url).path.rsplit("/", 1)[-1]).lower()
+    stem = re.sub(r"\.(jpe?g|png|webp|avif)$", "", filename, flags=re.I)
+    has_size_variant = bool(IMAGE_SIZE_VARIANT_RE.search(stem) or IMAGE_WIDTH_VARIANT_RE.search(stem))
+    if stem.endswith(("-scaled", "_scaled")) or not has_size_variant:
+        variant_priority = 0
+    elif max_side >= 1000:
+        variant_priority = 1
+    elif max_side >= 500:
+        variant_priority = 2
+    else:
+        variant_priority = 3
+    return (variant_priority, -area, -max_side, candidate_source_priority(item), item.order)
+
+
+def merge_image_candidate_metadata(target: ImageCandidate, other: ImageCandidate) -> None:
+    for reason in other.reasons:
+        target.add_reason(reason)
+    target.width = max([value for value in (target.width, other.width) if value is not None], default=None)
+    target.height = max([value for value in (target.height, other.height) if value is not None], default=None)
+    if not target.alt and other.alt:
+        target.alt = other.alt
+    target.order = min(target.order, other.order)
+    if candidate_source_priority(other) < candidate_source_priority(target):
+        target.source = other.source
+
+
 def normalize_wix_media_url(url: str) -> str:
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
@@ -865,9 +923,28 @@ def dedupe_image_candidates(candidates: list[ImageCandidate]) -> list[ImageCandi
     for item in candidates:
         key = image_identity_key(item.url)
         previous = best_by_key.get(key)
-        if previous is None or item.score > previous.score:
+        if previous is None:
             best_by_key[key] = item
-    return sorted(best_by_key.values(), key=lambda c: c.score, reverse=True)
+        elif image_variant_sort_key(item) < image_variant_sort_key(previous):
+            merge_image_candidate_metadata(item, previous)
+            best_by_key[key] = item
+        else:
+            merge_image_candidate_metadata(previous, item)
+    return sorted(best_by_key.values(), key=candidate_sort_key)
+
+
+def candidate_source_priority(item: ImageCandidate) -> int:
+    priorities = {
+        "structured": 0,
+        "dom": 1,
+        "meta": 2,
+        "link": 3,
+    }
+    return priorities.get(item.source, 4)
+
+
+def candidate_sort_key(item: ImageCandidate) -> tuple[int, int]:
+    return (candidate_source_priority(item), item.order)
 
 
 def normalized_hostname(url: str) -> str:
@@ -890,6 +967,7 @@ def source_site_aliases(url: str) -> set[str]:
         first_label,
         first_label.replace("-", " "),
     }
+    aliases.update(SOURCE_SITE_ALIAS_OVERRIDES.get(hostname, set()))
     generic_aliases = {
         "antique",
         "antiques",
@@ -991,6 +1069,8 @@ def filter_domain_image_candidates(candidates: list[ImageCandidate], page_url: s
     if hostname in EARLY_GALLERY_FILTER_DOMAINS:
         candidates = filter_early_contiguous_gallery(candidates)
     if hostname in SECOND_IMAGE_FILTER_DOMAINS and len(candidates) >= 2:
+        if any("structured product image" in item.reasons for item in candidates[:2]):
+            return candidates
         return candidates[:1] + candidates[2:]
     return candidates
 
@@ -1001,8 +1081,8 @@ def filter_early_contiguous_gallery(candidates: list[ImageCandidate]) -> list[Im
             item
             for item in candidates
             if item.order < 100_000
-            and item.score >= 20
             and re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", urlparse(item.url).path, re.I)
+            and not has_image_noise(item)
         ],
         key=lambda item: item.order,
     )
@@ -1033,7 +1113,7 @@ def prefer_primary_product_gallery(candidates: list[ImageCandidate]) -> list[Ima
     ]
     if len(gallery) < 2:
         return candidates
-    return sorted(gallery, key=lambda item: (item.order, -item.score))
+    return sorted(gallery, key=lambda item: item.order)
 
 
 def prefer_authoritative_image_list(candidates: list[ImageCandidate], image_urls: list[str]) -> list[ImageCandidate]:
@@ -1044,7 +1124,7 @@ def prefer_authoritative_image_list(candidates: list[ImageCandidate], image_urls
     matched = [item for item in candidates if image_identity_key(item.url) in key_order]
     if len(matched) < 2:
         return candidates
-    return sorted(matched, key=lambda item: (key_order[image_identity_key(item.url)], -item.score, item.order))
+    return sorted(matched, key=lambda item: (key_order[image_identity_key(item.url)], item.order))
 
 
 def prefer_page_path_images(candidates: list[ImageCandidate], page_url: str) -> list[ImageCandidate]:
@@ -1090,7 +1170,7 @@ def prefer_numbered_gallery(candidates: list[ImageCandidate]) -> list[ImageCandi
             break
     if len(gallery) >= 3:
         for item in gallery:
-            item.add(30, "numbered gallery sequence")
+            item.add_reason("numbered gallery sequence")
         return gallery
     return candidates
 
@@ -1131,7 +1211,9 @@ def prefer_early_product_gallery(candidates: list[ImageCandidate]) -> list[Image
     useful = [
         item
         for item in candidates
-        if item.score >= 25 and item.order < 100_000 and not re.search(r"\.(svg|gif)(\?|$)", urlparse(item.url).path, re.I)
+        if item.order < 100_000
+        and not re.search(r"\.(svg|gif)(\?|$)", urlparse(item.url).path, re.I)
+        and not has_image_noise(item)
     ]
     if len(useful) < 8:
         return candidates
@@ -1147,7 +1229,7 @@ def prefer_early_product_gallery(candidates: list[ImageCandidate]) -> list[Image
     if len(best_group) < 4:
         return candidates
     early_ids = {id(item) for item in best_group}
-    early_sorted = sorted(best_group, key=lambda item: (item.order, -item.score))
+    early_sorted = sorted(best_group, key=lambda item: item.order)
     return early_sorted + [item for item in candidates if id(item) not in early_ids and item.source == "structured"]
 
 
@@ -1262,7 +1344,8 @@ def prefer_current_product_group(
     useful = [
         item
         for item in candidates
-        if item.score >= 20 and not re.search(r"\.(svg|gif|mp4|mov|webm)(\?|$)", urlparse(item.url).path, re.I)
+        if not re.search(r"\.(svg|gif|mp4|mov|webm)(\?|$)", urlparse(item.url).path, re.I)
+        and not has_image_noise(item)
     ]
     if len(useful) < 4:
         return candidates
@@ -1273,7 +1356,7 @@ def prefer_current_product_group(
         if key:
             alt_groups.setdefault(key, []).append(item)
     if alt_groups:
-        best_alt = max(alt_groups.values(), key=lambda group: (len(group), sum(i.score for i in group)))
+        best_alt = max(alt_groups.values(), key=lambda group: (len(group), -min(i.order for i in group)))
         if len(best_alt) >= 3:
             host = dominant_host(best_alt)
             keep_ids = {id(item) for item in best_alt}
@@ -1291,14 +1374,13 @@ def prefer_current_product_group(
     if series_groups:
         product_tokens = name_tokens(product_name)
 
-        def group_rank(group: list[ImageCandidate]) -> tuple[int, int, int, int]:
+        def group_rank(group: list[ImageCandidate]) -> tuple[int, int, int]:
             key = image_series_key(group[0])
             key_tokens = set(re.findall(r"[a-z0-9]{4,}", key))
             token_overlap = len(product_tokens & key_tokens)
             return (
                 token_overlap,
                 len(group),
-                sum(item.score for item in group),
                 -min(item.order for item in group),
             )
 
@@ -1309,16 +1391,9 @@ def prefer_current_product_group(
             for item in useful:
                 if id(item) in keep_ids:
                     continue
-                if candidate_matches_product_name(item, product_name) and item.score >= 60 and not image_series_key(item):
+                if candidate_matches_product_name(item, product_name) and not image_series_key(item):
                     keep_ids.add(id(item))
             return [item for item in candidates if id(item) in keep_ids or image_series_key(item) == best_key]
-
-    top_score = max(item.score for item in useful)
-    if top_score >= 180:
-        high_confidence = [item for item in useful if item.score >= top_score * 0.6]
-        if len(high_confidence) >= 3:
-            keep_ids = {id(item) for item in high_confidence}
-            return [item for item in candidates if id(item) in keep_ids]
 
     return candidates
 
@@ -1335,46 +1410,55 @@ def normalize_url(raw: str, base_url: str) -> str:
     return compact_url(url)
 
 
+def srcset_candidates(srcset: str) -> list[tuple[str, int]]:
+    candidates: list[tuple[str, int]] = []
+    for match in re.finditer(
+        r"(?P<url>\S+)\s+(?P<descriptor>\d+(?:\.\d+)?[wx])(?=\s*(?:,|$))",
+        srcset,
+        re.I,
+    ):
+        url = match.group("url").strip().lstrip(",")
+        descriptor = match.group("descriptor").lower()
+        if not url:
+            continue
+        width = 1
+        if descriptor.endswith("w"):
+            try:
+                width = int(float(descriptor[:-1]))
+            except ValueError:
+                width = 1
+        elif descriptor.endswith("x"):
+            try:
+                width = int(float(descriptor[:-1]) * 1000)
+            except ValueError:
+                width = 1
+        candidates.append((url, width))
+    if not candidates:
+        fallback = srcset.strip().split(maxsplit=1)[0].strip().strip(",")
+        if fallback:
+            candidates.append((fallback, 1))
+    return candidates
+
+
 def pick_srcset_best(srcset: str) -> str:
     best_url = ""
-    best_score = -1
-    for part in srcset.split(","):
-        bits = part.strip().split()
-        if not bits:
-            continue
-        url = bits[0]
-        score = 1
-        if len(bits) > 1:
-            token = bits[1].lower()
-            if token.endswith("w") and token[:-1].isdigit():
-                score = int(token[:-1])
-            elif token.endswith("x"):
-                try:
-                    score = int(float(token[:-1]) * 1000)
-                except ValueError:
-                    pass
-        if score > best_score:
+    best_width = -1
+    for url, width in srcset_candidates(srcset):
+        if width > best_width:
             best_url = url
-            best_score = score
+            best_width = width
     return best_url
 
 
 def pick_srcset_width(srcset: str, preferred_width: int) -> str:
     best_url = ""
     best_distance: int | None = None
-    for part in srcset.split(","):
-        bits = part.strip().split()
-        if len(bits) < 2:
-            continue
-        token = bits[1].lower()
-        if not token.endswith("w") or not token[:-1].isdigit():
-            continue
-        width = int(token[:-1])
+    for url, width in srcset_candidates(srcset):
         distance = abs(width - preferred_width)
         if best_distance is None or distance < best_distance or (
             distance == best_distance and width == preferred_width
         ):
-            best_url = bits[0]
+            best_url = url
             best_distance = distance
     return best_url
 
@@ -1833,6 +1917,76 @@ def extract_meta_info(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any
         normalize_url(meta("og:image", "twitter:image", "twitter:image:src"), base_url),
     ]
     return info, [u for u in images if u]
+
+
+def parse_nextjs_flight_records(script_text: str) -> list[Any]:
+    records: list[Any] = []
+    marker = "self.__next_f.push("
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        start = script_text.find(marker, search_from)
+        if start < 0:
+            break
+        payload_start = start + len(marker)
+        try:
+            payload, end = decoder.raw_decode(script_text[payload_start:])
+        except json.JSONDecodeError:
+            search_from = payload_start
+            continue
+        records.append(payload)
+        search_from = payload_start + end
+    return records
+
+
+def walk_json_like(value: Any) -> list[Any]:
+    items = [value]
+    if isinstance(value, dict):
+        for child in value.values():
+            items.extend(walk_json_like(child))
+    elif isinstance(value, list):
+        for child in value:
+            items.extend(walk_json_like(child))
+    return items
+
+
+def extract_nextjs_flight_payloads(soup: BeautifulSoup) -> list[Any]:
+    payloads: list[Any] = []
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text()
+        if not raw or "self.__next_f.push" not in raw:
+            continue
+        for record in parse_nextjs_flight_records(raw):
+            if not isinstance(record, list) or len(record) < 2 or not isinstance(record[1], str):
+                continue
+            text = record[1]
+            for match in re.finditer(r"(?:^|\n)\d+:", text):
+                payload_text = text[match.end() :].lstrip()
+                if not payload_text:
+                    continue
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(payload_text)
+                except json.JSONDecodeError:
+                    continue
+                payloads.append(payload)
+    return payloads
+
+
+def extract_nextjs_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for payload in extract_nextjs_flight_payloads(soup):
+        for item in walk_json_like(payload):
+            if not isinstance(item, dict):
+                continue
+            product = item.get("object") if isinstance(item.get("object"), dict) else item
+            if not isinstance(product, dict):
+                continue
+            if not (product.get("images") or product.get("cdnImages")):
+                continue
+            for key in ("images", "cdnImages"):
+                for image_url in extract_image_urls(product.get(key), base_url):
+                    urls.append(image_url)
+    return list(dict.fromkeys(urls))
 
 
 def extract_nextjs_product_info(soup: BeautifulSoup) -> dict[str, Any]:
@@ -3280,7 +3434,6 @@ def try_monument_items_api(
     selected_images = [
         {
             "url": image,
-            "score": 100,
             "source": "monument-items-api",
             "alt": product_info.get("name", ""),
             "width": None,
@@ -3356,8 +3509,7 @@ def extract_auctionet_page_data(soup: BeautifulSoup) -> dict[str, Any]:
     return info
 
 
-def infer_context_score(element: Any) -> tuple[int, list[str]]:
-    score = 0
+def infer_context_reasons(element: Any) -> list[str]:
     reasons: list[str] = []
     cursor = element
     for depth in range(5):
@@ -3367,19 +3519,34 @@ def infer_context_score(element: Any) -> tuple[int, list[str]]:
             clean_text(cursor.get(attr, "")) for attr in ("class", "id", "role", "aria-label")
         )
         if re.search(r"\bproduct-gallery\b|gallery-lightbox", attrs, re.I):
-            score += max(28, 70 - depth * 8)
             reasons.append("inside primary product gallery")
         elif re.search(r"\bproduct-list\b|product-list-item|grid-item", attrs, re.I):
-            score -= max(24, 64 - depth * 8)
             reasons.append("inside product listing block")
         elif re.search(r"(header|footer|nav|menu|newsletter|social|recommend|related)", attrs, re.I):
-            score -= max(30, 60 - depth * 6)
             reasons.append("inside likely non-product block")
         elif re.search(r"(product|pdp|gallery|carousel|media|image|photo|slider|zoom)", attrs, re.I):
-            score += 18 - depth * 2
             reasons.append("inside product/media block")
         cursor = cursor.parent
-    return score, reasons
+    return reasons
+
+
+def has_image_noise(item: ImageCandidate) -> bool:
+    if item.source == "structured" or "structured product image" in item.reasons:
+        return False
+    path = urlparse(item.url).path.lower()
+    if "site identity image" in item.reasons:
+        return True
+    if NOISE_RE.search(item.url) or NOISE_RE.search(item.alt):
+        return True
+    if SMALL_SIZE_RE.search(path):
+        return True
+    if re.search(r"/assets/(opengraph|logo|social|icons?)[\w.-]*\.(png|jpe?g|webp|avif)$", path, re.I):
+        return True
+    if item.width and item.height and (item.width < 180 or item.height < 180):
+        return True
+    if re.search(r"\.(svg|gif)(\?|$)", path, re.I):
+        return True
+    return bool(re.search(r"(?:^|\.)icons8\.com$", urlparse(item.url).hostname or "", re.I))
 
 
 def parse_size(value: Any) -> int | None:
@@ -3393,7 +3560,6 @@ def add_candidate(
     candidates: dict[str, ImageCandidate],
     raw_url: str,
     base_url: str,
-    points: int,
     reason: str,
     source: str,
     element: Any | None = None,
@@ -3412,19 +3578,22 @@ def add_candidate(
         return
     if re.search(r"\.(mp4|mov|webm|m4v|avi|pdf|zip)(\?|$)", path, re.I):
         return
-    item = candidates.setdefault(url, ImageCandidate(url=url, source=source))
-    item.add(points, reason)
+    item = candidates.get(url)
+    if item is None:
+        item = ImageCandidate(url=url, source=source)
+        candidates[url] = item
+    elif candidate_source_priority(ImageCandidate(url=url, source=source)) < candidate_source_priority(item):
+        item.source = source
+    item.add_reason(reason)
     item.order = min(item.order, order)
     if element is not None:
         item.alt = clean_text(element.get("alt") or item.alt)
-        item.width = parse_size(element.get("width")) or item.width
-        item.height = parse_size(element.get("height")) or item.height
-        context_score, context_reasons = infer_context_score(element)
-        if context_score:
-            item.score += context_score
-            for context_reason in context_reasons:
-                if context_reason not in item.reasons:
-                    item.reasons.append(context_reason)
+        width = parse_size(element.get("width"))
+        height = parse_size(element.get("height"))
+        item.width = max([value for value in (item.width, width) if value is not None], default=None)
+        item.height = max([value for value in (item.height, height) if value is not None], default=None)
+        for context_reason in infer_context_reasons(element):
+            item.add_reason(context_reason)
 
 
 def gather_image_candidates(
@@ -3436,9 +3605,9 @@ def gather_image_candidates(
 ) -> list[ImageCandidate]:
     candidates: dict[str, ImageCandidate] = {}
     for order, url in enumerate(structured_images):
-        add_candidate(candidates, url, base_url, 90, "structured product image", "structured", order=order)
+        add_candidate(candidates, url, base_url, "structured product image", "structured", order=order)
     for order, url in enumerate(meta_images, len(structured_images)):
-        add_candidate(candidates, url, base_url, 45, "open graph image", "meta", order=order)
+        add_candidate(candidates, url, base_url, "open graph image", "meta", order=order)
 
     for order, img in enumerate(soup.find_all(["img", "source"]), len(structured_images) + len(meta_images)):
         attrs = []
@@ -3449,40 +3618,43 @@ def gather_image_candidates(
             if img.get(attr):
                 attrs.append(pick_srcset_best(str(img[attr])))
         for raw in attrs:
-            add_candidate(candidates, raw, base_url, 12, "page image candidate", "dom", img, order=order)
+            add_candidate(candidates, raw, base_url, "page image candidate", "dom", img, order=order)
 
     for order, link in enumerate(soup.find_all("a"), 100_000):
         href = link.get("href", "")
         if re.search(r"\.(jpe?g|png|webp|avif)(\?|$)", href, re.I):
-            add_candidate(candidates, href, base_url, 8, "linked image file", "link", link, order=order)
+            add_candidate(candidates, href, base_url, "linked image file", "link", link, order=order)
 
     name_tokens = [t.lower() for t in re.findall(r"[a-zA-Z0-9]{4,}", product_name or "")][:8]
     for item in candidates.values():
         haystack = f"{item.url} {item.alt}".lower()
         path = urlparse(item.url).path.lower()
         if PRODUCT_RE.search(item.url):
-            item.add(14, "product-like URL")
+            item.add_reason("product-like URL")
+        if "inside likely non-product block" in item.reasons and contains_source_site_name(item.alt, base_url):
+            item.add_reason("site identity image")
         if NOISE_RE.search(item.url) or NOISE_RE.search(item.alt):
-            item.add(-45, "noise keyword")
+            item.add_reason("noise keyword")
         if SMALL_SIZE_RE.search(path):
-            item.add(-30, "very small filename size")
+            item.add_reason("very small filename size")
         if any(token in haystack for token in name_tokens):
-            item.add(16, "matches product name")
+            item.add_reason("matches product name")
         if re.match(r"^view\s+\d+$", item.alt.strip(), re.I):
-            item.add(30, "generic product gallery alt")
+            item.add_reason("generic product gallery alt")
         if re.search(r"/assets/(opengraph|logo|social|icons?)[\w.-]*\.(png|jpe?g|webp|avif)$", path, re.I):
-            item.add(-50, "site-level asset")
+            item.add_reason("site-level asset")
         if item.width and item.height:
             if item.width < 180 or item.height < 180:
-                item.add(-35, "small declared dimensions")
+                item.add_reason("small declared dimensions")
             elif item.width >= 500 and item.height >= 500:
-                item.add(20, "large declared dimensions")
+                item.add_reason("large declared dimensions")
         if re.search(r"\.(svg|gif)(\?|$)", path, re.I):
-            item.add(-80, "low-value image format")
+            item.add_reason("low-value image format")
         if re.search(r"(?:^|\.)icons8\.com$", urlparse(item.url).hostname or "", re.I):
-            item.add(-120, "third-party icon asset")
-    ranked = sorted(candidates.values(), key=lambda c: c.score, reverse=True)
-    return ranked
+            item.add_reason("third-party icon asset")
+    ordered = sorted(candidates.values(), key=candidate_sort_key)
+    usable = [item for item in ordered if not has_image_noise(item)]
+    return usable or ordered
 
 
 def fetch_static(url: str) -> tuple[str, str]:
@@ -3794,6 +3966,7 @@ def extract(
     inline_shopify_info, inline_shopify_images = extract_inline_shopify_product_json(soup, final_url)
     analytics_info = extract_analytics_product_info(soup)
     nextjs_info = extract_nextjs_product_info(soup)
+    nextjs_images = extract_nextjs_product_image_urls(soup, final_url)
     auctionet_info = extract_auctionet_page_data(soup)
     domain_info = extract_domain_product_info(soup, final_url)
     domain_product_images = extract_domain_product_image_urls(soup, final_url)
@@ -3826,14 +3999,22 @@ def extract(
     product_info = sanitize_source_product_info(product_info, final_url)
     product_info["page_url"] = final_url
 
-    authoritative_images = domain_product_images or shopify_images or inline_shopify_images or jsonld_images
+    authoritative_images = (
+        domain_product_images
+        or nextjs_images
+        or shopify_images
+        or inline_shopify_images
+        or jsonld_images
+    )
     authoritative_keys = {
         key
         for key in (image_identity_key(url) for url in authoritative_images)
         if key
     }
     has_authoritative_gallery = len(authoritative_keys) >= 3
-    structured_images = list(dict.fromkeys(domain_product_images + jsonld_images + shopify_images + inline_shopify_images))
+    structured_images = list(
+        dict.fromkeys(domain_product_images + nextjs_images + jsonld_images + shopify_images + inline_shopify_images)
+    )
     candidates = gather_image_candidates(
         soup,
         final_url,
@@ -3853,7 +4034,6 @@ def extract(
     selected = [
         {
             "url": c.url,
-            "score": c.score,
             "source": c.source,
             "alt": c.alt,
             "width": c.width,
@@ -3880,7 +4060,7 @@ def extract(
         "product": product_info,
         "images": selected,
         "rejected_preview": [
-            {"url": c.url, "score": c.score, "reasons": c.reasons}
+            {"url": c.url, "reasons": c.reasons}
             for c in candidates[len(selected) : len(selected) + 10]
         ],
     }
