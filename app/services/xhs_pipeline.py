@@ -19,7 +19,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.services.extractor import contains_source_site_name
-from app.services.storage import USER_AGENT, upload_to_superbed
+from app.services.storage import USER_AGENT, image_response, upload_to_superbed
 
 
 TARGET_RATIO = 3.0 / 4.0
@@ -102,9 +102,13 @@ def to_rgb(image: Image.Image) -> Image.Image:
 
 
 def download_image(url: str) -> Image.Image:
-    response = session().get(url, timeout=60)
-    response.raise_for_status()
-    return open_image_bytes(response.content)
+    with session() as client:
+        response = image_response(url, client, timeout=60, stream=False)
+        try:
+            response.raise_for_status()
+            return open_image_bytes(response.content)
+        finally:
+            response.close()
 
 
 def save_jpeg(image: Image.Image, path: Path, quality: int = 95) -> None:

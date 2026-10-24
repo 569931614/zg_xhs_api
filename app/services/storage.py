@@ -183,9 +183,51 @@ def extract_superbed_url(payload: Any) -> str:
     return ""
 
 
+def public_image_cdn_url(url: str) -> str:
+    if not env_bool("IMAGE_DOWNLOAD_CDN_FALLBACK", True):
+        return ""
+    parsed = urlparse(url)
+    # Only public uploads on this known unreachable origin may use the CDN.
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.netloc.lower() not in {"urbanmodern.nl", "www.urbanmodern.nl"}
+        or not parsed.path.startswith("/wp-content/uploads/")
+        or Path(parsed.path).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
+        or parsed.query
+    ):
+        return ""
+    return f"https://i0.wp.com/{parsed.netloc}{parsed.path}"
+
+
+def image_response(
+    url: str, session: requests.Session, timeout: int = 45, stream: bool = True
+) -> requests.Response:
+    fallback_url = public_image_cdn_url(url)
+    try:
+        response = session.get(url, timeout=(5, timeout) if fallback_url else timeout, stream=stream)
+    except (requests.ConnectionError, requests.Timeout):
+        if not fallback_url:
+            raise
+    else:
+        if not fallback_url or response.status_code not in {502, 503, 504}:
+            return response
+        response.close()
+
+    logger.warning("image_download stage=cdn_fallback source_host=%s", urlparse(url).netloc)
+    response = session.get(fallback_url, timeout=(10, timeout), stream=stream)
+    try:
+        response.raise_for_status()
+        if not response.headers.get("content-type", "").lower().startswith("image/"):
+            raise ImageHostingError("Image CDN returned a non-image response")
+    except Exception:
+        response.close()
+        raise
+    return response
+
+
 def download_image(url: str, target_dir: Path, session: requests.Session) -> tuple[Path, int]:
     target_dir.mkdir(parents=True, exist_ok=True)
-    response = session.get(url, timeout=45, stream=True)
+    response = image_response(url, session)
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -205,14 +247,20 @@ def download_image(url: str, target_dir: Path, session: requests.Session) -> tup
     target_path = local_image_path(url, target_dir, content_type)
 
     total = 0
-    with target_path.open("wb") as file:
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > max_bytes:
-                raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
-            file.write(chunk)
+    try:
+        with target_path.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ImageHostingError(f"Image exceeds max download size: {max_bytes} bytes")
+                file.write(chunk)
+    except Exception:
+        target_path.unlink(missing_ok=True)
+        raise
+    finally:
+        response.close()
     return target_path, total
 
 

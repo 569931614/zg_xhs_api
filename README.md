@@ -103,6 +103,8 @@ Content-Type: application/json
 
 服务会在 `render=auto` 时先静态抓取；如果商品信息、图片或尺寸信息不足，会自动再用浏览器渲染抓取一次。遇到 Cloudflare 真人验证页时，会在授权配置下尝试使用 DrissionPage + Chrome/Chromium fallback 获取通过验证后的 HTML。尺寸缺失不会阻断返回。
 
+Urbanmodern 的公开商品图片在源站连接失败或返回 502/503/504 时，会通过 WordPress 图片 CDN (`i0.wp.com`) 重试下载，再走原有图床上传流程。此兜底只适用于该站 `/wp-content/uploads/` 下不带查询参数的图片，不会转发其他站点或带签名参数的 URL；设置 `IMAGE_DOWNLOAD_CDN_FALLBACK=false` 可关闭。抓取和小红书图片处理共用此下载兜底。
+
 ### 获取拍卖商品列表
 
 ```http

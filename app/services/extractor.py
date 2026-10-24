@@ -1549,6 +1549,22 @@ def extract_oldboy_product_image_urls(soup: BeautifulSoup, base_url: str) -> lis
 
 def extract_domain_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
     hostname = normalized_hostname(base_url)
+    if hostname == "recondicionar.com.br":
+        urls = []
+        for slide in soup.select(".js-product-slide"):
+            link = slide.select_one('a[data-fancybox="product-gallery"][href]')
+            raw_url = str(link.get("href") or "") if link else ""
+            if not raw_url:
+                image = slide.select_one(".js-product-slide-img")
+                if image:
+                    srcset = str(image.get("data-srcset") or image.get("srcset") or "")
+                    raw_url = pick_srcset_best(srcset) if srcset else str(
+                        image.get("data-src") or image.get("src") or ""
+                    )
+            url = normalize_url(raw_url, base_url)
+            if urlparse(url).scheme in {"http", "https"}:
+                urls.append(url)
+        return list(dict.fromkeys(urls))
     if hostname in ATKRIS_PRODUCT_IMAGE_DOMAINS:
         return extract_atkris_product_image_urls(soup, base_url)
     if hostname in SQUARESPACE_PRODUCT_DOMAINS:
@@ -1569,7 +1585,7 @@ def flatten_jsonld(node: Any) -> list[dict[str, Any]]:
             items.extend(flatten_jsonld(item))
     elif isinstance(node, dict):
         items.append(node)
-        for key in ("@graph", "itemListElement"):
+        for key in ("@graph", "itemListElement", "mainEntity"):
             if key in node:
                 items.extend(flatten_jsonld(node[key]))
     return items
@@ -1759,6 +1775,7 @@ def is_weak_existing_name(name: str) -> bool:
 def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[str, Any], list[str]]:
     product_info: dict[str, Any] = {}
     product_images: list[str] = []
+    products: list[dict[str, Any]] = []
     for script in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
         raw = script.string or script.get_text()
         if not raw.strip():
@@ -1770,53 +1787,92 @@ def extract_jsonld_products(soup: BeautifulSoup, base_url: str) -> tuple[dict[st
         for item in flatten_jsonld(parsed):
             if not jsonld_type_matches(item, "Product"):
                 continue
-            offer = as_list(item.get("offers"))
-            offer0 = offer[0] if offer and isinstance(offer[0], dict) else {}
-            brand = item.get("brand")
-            if isinstance(brand, dict):
-                brand = brand.get("name")
-            rating = item.get("aggregateRating")
-            if isinstance(rating, dict):
-                rating = {
-                    "ratingValue": rating.get("ratingValue"),
-                    "reviewCount": rating.get("reviewCount") or rating.get("ratingCount"),
-                }
-            price, currency = extract_offer_price(offer0)
-            current = {
-                "name": strip_source_site_suffix(clean_text(item.get("name")), base_url),
-                "description": clean_text(item.get("description")),
-                "sku": clean_text(item.get("sku") or item.get("mpn")),
-                "brand": clean_text(brand),
-                "price": price,
-                "currency": currency,
-                "availability": clean_text(offer0.get("availability")),
-                "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
-                "rating": rating,
-                "source": "json-ld",
+            products.append(item)
+
+    def page_key(raw_url: str) -> tuple[str, str, tuple]:
+        parsed_url = urlparse(urljoin(base_url, raw_url))
+        query = tuple(sorted(
+            (key, value) for key, value in parse_qsl(parsed_url.query)
+            if not key.lower().startswith("utm_") and key.lower() not in {"fbclid", "gclid"}
+        ))
+        return normalized_hostname(parsed_url.geturl()), unquote(parsed_url.path).rstrip("/"), query
+
+    page_keys = {page_key(base_url)}
+    canonical = soup.find("link", attrs={"rel": re.compile("canonical", re.I)})
+    if canonical and canonical.get("href"):
+        canonical_url = urljoin(base_url, str(canonical["href"]))
+        if normalized_hostname(canonical_url) == normalized_hostname(base_url):
+            page_keys.add(page_key(canonical_url))
+    matching = []
+    unaddressed = []
+    for item in products:
+        addresses = []
+        for value in (item.get("url"), item.get("@id"), item.get("mainEntityOfPage")):
+            for address in as_list(value):
+                if isinstance(address, dict):
+                    address = address.get("@id") or address.get("url")
+                if isinstance(address, str) and address:
+                    addresses.append(address)
+        for offer in as_list(item.get("offers")):
+            if isinstance(offer, dict) and isinstance(offer.get("url"), str) and offer["url"]:
+                addresses.append(offer["url"])
+        if any(page_key(address) in page_keys for address in addresses):
+            matching.append(item)
+        elif not addresses:
+            unaddressed.append(item)
+
+    # Recommendations often publish their own Product blocks on a detail page.
+    # Only merge blocks for this page, falling back to products without a URL.
+    for item in matching or unaddressed:
+        offer = as_list(item.get("offers"))
+        offer0 = offer[0] if offer and isinstance(offer[0], dict) else {}
+        brand = item.get("brand")
+        if isinstance(brand, dict):
+            brand = brand.get("name")
+        rating = item.get("aggregateRating")
+        if isinstance(rating, dict):
+            rating = {
+                "ratingValue": rating.get("ratingValue"),
+                "reviewCount": rating.get("reviewCount") or rating.get("ratingCount"),
             }
-            details = details_from_mapping(
-                item,
-                {
-                    "@context",
-                    "@type",
-                    "type",
-                    "name",
-                    "description",
-                    "image",
-                    "offers",
-                    "url",
-                    "aggregateRating",
-                    "additionalProperty",
-                },
-            )
-            details.update(details_from_property_values(item.get("additionalProperty")))
-            details = sanitize_source_creator_details(details, base_url)
-            if details:
-                current["details"] = details
-            current = sanitize_source_product_info(current, base_url)
-            add_synthesized_dimensions(current)
-            product_info = merge_product_info(product_info, current)
-            product_images.extend(extract_image_urls(item.get("image"), base_url))
+        price, currency = extract_offer_price(offer0)
+        current = {
+            "name": strip_source_site_suffix(clean_text(item.get("name")), base_url),
+            "description": clean_text(item.get("description")),
+            "sku": clean_text(item.get("sku") or item.get("mpn")),
+            "brand": clean_text(brand),
+            "price": price,
+            "currency": currency,
+            "availability": clean_text(offer0.get("availability")),
+            "url": normalize_url(clean_text(item.get("url") or offer0.get("url")), base_url),
+            "rating": rating,
+            "source": "json-ld",
+        }
+        details = details_from_mapping(
+            item,
+            {
+                "@context",
+                "@type",
+                "@id",
+                "type",
+                "name",
+                "description",
+                "image",
+                "offers",
+                "url",
+                "aggregateRating",
+                "additionalProperty",
+                "mainEntityOfPage",
+            },
+        )
+        details.update(details_from_property_values(item.get("additionalProperty")))
+        details = sanitize_source_creator_details(details, base_url)
+        if details:
+            current["details"] = details
+        current = sanitize_source_product_info(current, base_url)
+        add_synthesized_dimensions(current)
+        product_info = merge_product_info(product_info, current)
+        product_images.extend(extract_image_urls(item.get("image"), base_url))
     return product_info, list(dict.fromkeys(product_images))
 
 
