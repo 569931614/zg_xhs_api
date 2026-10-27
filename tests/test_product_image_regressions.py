@@ -24,6 +24,99 @@ def product_html(products):
 
 
 class ProductSelectionTest(unittest.TestCase):
+    def test_auctionet_uses_main_gallery_without_duplicate_thumbnails(self):
+        for count in (1, 2, 4):
+            for hostname in ("auctionet.com", "www.auctionet.com"):
+                for limit in (1, 12):
+                    with self.subTest(count=count, hostname=hostname, limit=limit):
+                        page_url = f"https://{hostname}/da/5490527-aluminium-sculpture"
+                        urls = [
+                            f"https://images.auctionet.com/thumbs/large_item_5490527_{index:032x}.jpg"
+                            for index in range(count)
+                        ]
+                        main = "".join(
+                            f'<div class="item-images__main"><a href="/da/5490527/images#image_{index}">'
+                            f'<img src="{url}"></a></div>'
+                            for index, url in enumerate(urls)
+                        )
+                        thumbs = "".join(
+                            f'<div class="item-images__thumb"><img src="{url.replace("large_item_", "mini_item_")}"></div>'
+                            for url in urls
+                        )
+                        html = (
+                            '<html><head><title>Aluminium sculpture</title>'
+                            f'<meta property="og:image" content="{urls[0]}"></head><body>'
+                            '<h1>Aluminium sculpture</h1>'
+                            '<img src="https://images.auctionet.com/uploads/mini_auction_company_example.png">'
+                            f'<div class="item-images">{main}{main}{thumbs}</div>'
+                            '<div class="related"><img src="https://images.auctionet.com/thumbs/large_item_1234_other.jpg"></div>'
+                            '</body></html>'
+                        )
+                        with patch("app.services.extractor.fetch_static", return_value=(html, page_url)):
+                            result = extract(page_url, False, limit)
+                        self.assertEqual([image["url"] for image in result["images"]], urls[:limit])
+
+    def test_auctionet_missing_gallery_keeps_metadata_fallback(self):
+        page_url = "https://auctionet.com/da/5490527-aluminium-sculpture"
+        image_url = "https://images.auctionet.com/thumbs/large_item_5490527_image.jpg"
+        html = (
+            f'<html><head><meta property="og:image" content="{image_url}"></head>'
+            '<body><h1>Aluminium sculpture</h1></body></html>'
+        )
+        with patch("app.services.extractor.fetch_static", return_value=(html, page_url)):
+            result = extract(page_url, False, 12)
+        self.assertEqual([image["url"] for image in result["images"]], [image_url])
+
+    def test_kaderdesign_primary_gallery_excludes_same_artist_recommendations(self):
+        page_url = "https://www.kaderdesign.com/available/p/1975-1990-abstract-sculpture-nr5"
+        cdn = "https://images.squarespace-cdn.com/content/v1/site"
+        sequence = [1, 7, 8, 2, 3, 4, 11, 5, 10, 6, 9, 10]
+        urls = [
+            f"{cdn}/current-{index}/Abstract-Sculpture-by-Cor-Dam-%235_{index:02d}.jpg"
+            for index in sequence
+        ]
+        expected = list(dict.fromkeys(urls))
+        gallery = ""
+        for kind in ("thumbnails", "slides"):
+            gallery += f'<div class="product-gallery-{kind}">'
+            gallery += "".join(
+                f'<img class="product-gallery-{kind}-item-image" data-src="{url}" '
+                'data-image-dimensions="1782x2669">'
+                for url in urls
+            )
+            gallery += "</div>"
+        related = "".join(
+            f'<img class="grid-item-image" src="{cdn}/related-{index}/'
+            f'Abstract-Sculpture-by-Cor-Dam-%2336_{index:02d}.jpg" '
+            'alt="Abstract Sculpture by Cor Dam" width="1782" height="2669">'
+            for index in range(1, 15)
+        )
+        html = (
+            '<html><head><title>Cor Dam Abstract Sculpture</title>'
+            + product_html([{
+                "@type": "Product",
+                "url": page_url,
+                "name": "Cor Dam Abstract Sculpture",
+                "image": "http://static1.squarespace.com/static/site/Abstract-Sculpture-%235_01.jpg?format=1500w",
+                "offers": {"price": "3500", "priceCurrency": "EUR"},
+            }])
+            + '</head><body><header><img src="/kader_logo.png"></header>'
+            '<h1 class="product-title">Cor Dam Abstract Sculpture</h1>'
+            f'<div class="product-gallery">{gallery}</div>'
+            f'<div class="product-list"><div class="product-list-item">{related}</div></div>'
+            '</body></html>'
+        )
+        for hostname in ("www.kaderdesign.com", "kaderdesign.com"):
+            url = page_url.replace("www.kaderdesign.com", hostname)
+            for limit in (12, 4):
+                with self.subTest(hostname=hostname, limit=limit):
+                    with patch("app.services.extractor.fetch_static", return_value=(html, url)):
+                        result = extract(url, False, limit)
+                    self.assertEqual([image["url"] for image in result["images"]], expected[:limit])
+                    self.assertEqual(result["product"]["name"], "Cor Dam Abstract Sculpture")
+                    self.assertEqual(result["product"]["price"], "3500")
+                    self.assertEqual(result["product"]["currency"], "EUR")
+
     def test_nested_main_entity_excludes_recommendations_in_either_order(self):
         current = {
             "@type": "WebPage",

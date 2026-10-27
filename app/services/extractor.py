@@ -67,6 +67,7 @@ QUITTENBAUM_DOMAINS = {"quittenbaum.de"}
 WOO_PRODUCT_TITLE_DOMAINS = {"lipefurniture.com"}
 SQUARESPACE_PRODUCT_DOMAINS = {
     "altar.london",
+    "kaderdesign.com",
     "gallery-ornamentum.com",
     "mccullyandcrane.com",
     "fourquartershome.com",
@@ -1116,13 +1117,15 @@ def prefer_primary_product_gallery(candidates: list[ImageCandidate]) -> list[Ima
     return sorted(gallery, key=lambda item: item.order)
 
 
-def prefer_authoritative_image_list(candidates: list[ImageCandidate], image_urls: list[str]) -> list[ImageCandidate]:
+def prefer_authoritative_image_list(
+    candidates: list[ImageCandidate], image_urls: list[str], minimum_images: int = 2
+) -> list[ImageCandidate]:
     keys = list(dict.fromkeys(image_identity_key(url) for url in image_urls if image_identity_key(url)))
-    if len(keys) < 2:
+    if len(keys) < minimum_images:
         return candidates
     key_order = {key: index for index, key in enumerate(keys)}
     matched = [item for item in candidates if image_identity_key(item.url) in key_order]
-    if len(matched) < 2:
+    if len(matched) < minimum_images:
         return candidates
     return sorted(matched, key=lambda item: (key_order[image_identity_key(item.url)], item.order))
 
@@ -1549,6 +1552,12 @@ def extract_oldboy_product_image_urls(soup: BeautifulSoup, base_url: str) -> lis
 
 def extract_domain_product_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
     hostname = normalized_hostname(base_url)
+    if hostname == "auctionet.com":
+        urls = [
+            image_url_from_img_tag(img, base_url)
+            for img in soup.select(".item-images__main img")
+        ]
+        return list(dict.fromkeys(url for url in urls if urlparse(url).scheme in {"http", "https"}))
     if hostname == "recondicionar.com.br":
         urls = []
         for slide in soup.select(".js-product-slide"):
@@ -4079,7 +4088,11 @@ def extract(
         product_info.get("name", ""),
     )
     candidates = dedupe_image_candidates(candidates)
-    candidates = prefer_authoritative_image_list(candidates, authoritative_images)
+    candidates = prefer_authoritative_image_list(
+        candidates,
+        authoritative_images,
+        minimum_images=1 if normalized_hostname(final_url) == "auctionet.com" and domain_product_images else 2,
+    )
     if not has_authoritative_gallery:
         candidates = prefer_numbered_gallery(candidates)
         candidates = prefer_leading_filename_series(candidates)
